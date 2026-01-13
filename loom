@@ -1,0 +1,1408 @@
+#!/usr/bin/env python3
+"""CLI interface for Loom code understanding tools.
+
+Supports Python, JavaScript, and TypeScript codebases.
+
+Usage:
+  loom --help                 - Show this help message
+  loom understand <query>     - Semantic search for code
+  loom impact <name>          - What breaks if this changes
+  loom callers <name>         - What calls this function
+  loom tests <name>           - Suggest relevant tests
+  loom class <name>           - Explain a class
+  loom module <name>          - Explain a module
+  loom debug <error> [file]   - Get context for debugging
+  loom stats                  - Show codebase statistics
+  loom info                   - Detailed codebase info (alias for stats)
+  loom usage                  - Show tool usage report
+
+Codebase Management:
+  loom ingest <path>          - Ingest/re-ingest a codebase
+  loom query <text>           - Text search for entities
+  loom languages              - List supported languages
+
+Architecture Analysis:
+  loom architecture           - High-level architecture overview
+  loom central [n]            - Show n most connected entities (default 10)
+  loom orphans                - Show entities with no connections
+  loom path <from> <to>       - Find paths between entities
+  loom clusters <file>        - Analyze file cohesion for refactoring
+  loom clusters <file> --json - Output as JSON
+
+Refactoring:
+  loom extract <entity1> [entity2...] --preview
+                              - Preview extracting entities to new module
+  loom extract <entities...> --to <module> --preview
+                              - Preview with target module name
+  Example:
+    ./loom extract start_trace_run end_trace_run record_call --preview
+    ./loom extract start_trace_run end_trace_run --to trace_storage --preview
+
+Notes and Knowledge Base:
+  loom note <content>                  - Add analysis note
+  loom intent <entity> <why>           - Document why entity exists
+  loom hypothesis <text> [--about X]   - Record hypothesis, optionally link to entity
+  loom resolve <note_id> <yes|no>      - Confirm/refute hypothesis
+  loom check-hypothesis <note_id> <run_id> - Check hypothesis against trace data
+  loom about <entity>                  - Show all notes about entity
+  loom search-notes <query>            - Search knowledge base
+  loom note-stats                      - Show knowledge base statistics
+  loom update-note <id> <content>      - Update note content
+  loom delete-note <id>                - Delete a note
+  loom consolidate <id1> <id2> ... <title> - Merge notes into one
+
+Failure Tracking:
+  loom failure-log <message> [OPTIONS] - Log a failed fix attempt
+    Options:
+      --context TEXT        What you were working on (e.g. function name, error)
+      --entity TEXT         Entity name (function/class)
+      --file PATH           File path
+      --reason TEXT         Why it failed
+      --error TEXT          Related error message
+      --tag TAG             Add tag (can repeat)
+  loom attempted-fixes [OPTIONS]       - Query past failed fix attempts
+    Options:
+      --entity TEXT         Filter by entity name
+      --file PATH           Filter by file path
+      --tag TAG             Filter by tag
+      --search TEXT         Search in context and attempted fix
+      --limit N             Max results (default 50)
+  loom attempted-fixes recent [--days N] - Show recent failures (default 7 days)
+  loom attempted-fixes clear [--days N]  - Delete failures older than N days
+
+TODO Management:
+  loom todo add <title>              - Add a new TODO
+  loom todo add <title> --prompt "Detailed instructions..." --tag bug --critical
+  loom todo list                     - List TODOs (default: pending, ordered by position)
+  loom todo list --all               - Include completed/combined
+  loom todo list --status completed  - Filter by status
+  loom todo list --tag bug           - Filter by tag
+  loom todo next                     - Show next TODO (the one to work on)
+  loom todo show <id>                - Show details of a specific TODO
+  loom todo start <id>               - Start working on a TODO
+  loom todo done <id>                - Complete a TODO
+  loom todo done <id> --notes "How it was resolved"
+  loom todo combine <id1> <id2> [id3...] --title "Combined task"
+  loom todo move <id> <position>     - Reorder (move to position)
+  loom todo move <id> top            - Move to position 1
+  loom todo move <id> bottom         - Move to end
+  loom todo edit <id> --title "New title" --prompt "New prompt" --tag newtag
+  loom todo delete <id>              - Delete a TODO
+  loom todo stats                    - Quick stats
+  loom todo search <query>           - Search TODOs
+
+Testing:
+  loom test                            - Run tests with smart selection and automatic tracing
+  loom test [path]                     - Run specific test file/directory
+  loom test --mode=full                - Full tracing (always persist)
+  loom test --mode=fail                - Failure-focused mode (default, <1.5x overhead)
+    • Uses optimized failure-focused tracing by default
+    • Only persists traces when tests fail
+    • <1.5x overhead for passing tests, full trace on failures
+    • Re-ingests changed files
+    • Maps changes to impacted tests
+    • On failure: shows trace-enhanced output
+
+Tracing (advanced):
+  loom trace run <command>             - Run command with tracing (prefer ./loom test)
+  loom trace list                      - List recent trace runs
+  loom trace show <run_id>             - Show trace details
+  loom trace calls <function>          - Show all calls to a function
+
+Hypothesis-Driven Debugging:
+  # Form hypothesis about a bug
+  ./loom hypothesis "query() returns empty because embeddings aren't generated" --about query
+
+  # Run test that exercises the hypothesis
+  ./loom trace run "python -m pytest tests/test_codestore.py::test_query -v"
+
+  # Check if trace data supports/refutes hypothesis
+  ./loom check-hypothesis <hypothesis_note_id> <trace_run_id>
+"""
+import sys
+import os
+
+# Add the Loom directory to path
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+from loom_tools import (
+    understand, what_breaks_if_i_change, what_calls,
+    which_tests, explain_class, explain_module,
+    debug_context, usage_report,
+    add_finding, add_intent, add_hypothesis, resolve_hypothesis,
+    whats_known_about, search_knowledge, knowledge_stats,
+    architecture, central_entities, orphan_entities, find_path
+)
+from loom_base import get_active_project, set_active_project, clear_active_project
+from codestore import CodeStore
+
+def get_db_path(target_path):
+    """Get the database path for a target directory."""
+    from pathlib import Path
+    target = Path(target_path).resolve()
+    db_dir = target / ".loom"
+    db_dir.mkdir(exist_ok=True)
+    return str(db_dir / "store.db")
+
+
+def format_entity(entity, verbose=False):
+    """Format an entity for display."""
+    kind_icons = {
+        "module": "[M]",
+        "class": "[C]",
+        "function": "[F]",
+        "variable": "[V]",
+    }
+    icon = kind_icons.get(entity.get("kind", ""), "[?]")
+    name = entity.get("name", "unknown")
+    result = f"{icon} {name}"
+    if verbose and entity.get("intent"):
+        intent = entity["intent"]
+        if len(intent) > 80:
+            intent = intent[:77] + "..."
+        result += f"\n    {intent}"
+    return result
+
+
+def cmd_ingest(target_path):
+    """Ingest a codebase into Loom."""
+    from pathlib import Path
+    target = Path(target_path).resolve()
+
+    if not target.exists():
+        print(f"Error: Path does not exist: {target}")
+        return 1
+    if not target.is_dir():
+        print(f"Error: Path is not a directory: {target}")
+        return 1
+
+    print(f"Ingesting: {target}")
+    print()
+
+    db_path = get_db_path(str(target))
+
+    # Remove existing database if present
+    if Path(db_path).exists():
+        print("Removing existing database...")
+        Path(db_path).unlink()
+
+    store = CodeStore(db_path)
+
+    # Ingest files
+    print("Parsing source files...")
+    stats = store.ingest_files(str(target))
+    print(f"  Modules:   {stats.get('modules', 0)}")
+    print(f"  Functions: {stats.get('functions', 0)}")
+    print(f"  Classes:   {stats.get('classes', 0)}")
+    if stats.get("errors"):
+        print(f"  Errors:    {stats['errors']}")
+    print()
+
+    # Analyze imports
+    print("Analyzing imports...")
+    import_stats = store.analyze_imports()
+    print(f"  Analyzed:      {import_stats.get('analyzed', 0)} modules")
+    print(f"  Imports:       {import_stats.get('imports_found', 0)} found")
+    print(f"  Relationships: {import_stats.get('relationships_created', 0)} created")
+    print()
+
+    # Analyze calls
+    print("Analyzing function calls...")
+    call_stats = store.analyze_calls()
+    print(f"  Analyzed:      {call_stats.get('analyzed', 0)} functions")
+    print(f"  Calls:         {call_stats.get('calls_found', 0)} found")
+    print(f"  Relationships: {call_stats.get('relationships_created', 0)} created")
+    print()
+
+    print(f"Database saved to: {db_path}")
+    print()
+
+    # Set as active project for future commands
+    set_active_project(target)
+    print(f"Active project set to: {target}")
+
+    store.close()
+    return 0
+
+
+def cmd_query(text):
+    """Search for entities matching a query."""
+    cs = CodeStore('.loom/store.db')
+    results = cs.query(text)
+
+    if not results:
+        print(f"No results found for: {text}")
+        return 0
+
+    print(f"Found {len(results)} result(s) for '{text}':")
+    print()
+
+    for r in results:
+        entity = r["entity"]
+        matches = r.get("matches", [])
+
+        print(format_entity(entity, verbose=True))
+        if matches:
+            print(f"    Matched in: {', '.join(matches)}")
+
+        metadata = entity.get("metadata") or {}
+        if metadata.get("file_path"):
+            file_path = metadata["file_path"]
+            lineno = metadata.get("lineno", "?")
+            print(f"    Location: {file_path}:{lineno}")
+        print()
+
+    return 0
+
+
+def cmd_languages():
+    """Show supported languages."""
+    from parsers import PythonParser, JavaScriptParser, TypeScriptParser
+    from parsers.typescript_parser import TSXParser
+
+    print("Supported languages:")
+    parsers = [PythonParser(), JavaScriptParser(), TypeScriptParser(), TSXParser()]
+    for parser in parsers:
+        exts = ', '.join(parser.file_extensions)
+        print(f"  {parser.language}: {exts}")
+    return 0
+
+
+def cmd_info():
+    """Show detailed codebase info."""
+    from pathlib import Path
+    cs = CodeStore('.loom/store.db')
+
+    print("Loom Codebase Info")
+    print("=" * 60)
+    print()
+
+    # Count entities by kind
+    modules = cs.find_entities(kind="module")
+    functions = cs.find_entities(kind="function")
+    classes = cs.find_entities(kind="class")
+
+    print("Entities:")
+    print(f"  Modules:   {len(modules)}")
+    print(f"  Functions: {len(functions)}")
+    print(f"  Classes:   {len(classes)}")
+    print()
+
+    # Count relationships
+    cursor = cs.conn.execute(
+        "SELECT relation, COUNT(*) as cnt FROM relationships GROUP BY relation"
+    )
+    rel_counts = dict(cursor.fetchall())
+
+    print("Relationships:")
+    for rel, count in sorted(rel_counts.items()):
+        print(f"  {rel}: {count}")
+    print()
+
+    # Test coverage
+    test_modules = [m for m in modules if "test" in m.get("name", "").lower()]
+    print(f"Test Modules: {len(test_modules)}")
+
+    # Database file info
+    db_path = Path(".loom/store.db")
+    if db_path.exists():
+        size_kb = db_path.stat().st_size / 1024
+        print(f"Database Size: {size_kb:.1f} KB")
+
+    return 0
+
+
+# --- Trace Commands ---
+
+def cmd_trace_run(command):
+    """Run a command with tracing enabled.
+
+    Note: For testing, prefer './loom test' which provides automatic tracing
+    with smart test selection and failure-focused mode for minimal overhead.
+    This command is for advanced use cases where you need to trace non-test code.
+    """
+    import subprocess
+    from tracer import trace_run
+    import time as time_module
+
+    print("Note: Prefer './loom test' for automatic tracing with smart test selection.")
+    print()
+    print(f"Running with tracing: {command}")
+    print()
+
+    start = time_module.perf_counter()
+
+    with trace_run(command=command, db_path='.loom/store.db') as run_id:
+        print(f"Trace run: {run_id}")
+        print("-" * 60)
+
+        # Execute the command
+        result = subprocess.run(command, shell=True, capture_output=False)
+        exit_code = result.returncode
+
+    elapsed = time_module.perf_counter() - start
+
+    print("-" * 60)
+    print(f"Exit code: {exit_code}")
+    print(f"Duration: {elapsed:.2f}s")
+    print(f"Run ID: {run_id}")
+    print()
+    print(f"View results with: ./loom trace show {run_id}")
+
+    return exit_code
+
+
+def cmd_trace_list():
+    """List recent trace runs."""
+    cs = CodeStore('.loom/store.db')
+
+    cursor = cs.conn.execute("""
+        SELECT run_id, command, started_at, ended_at, status, exit_code
+        FROM trace_runs
+        ORDER BY started_at DESC
+        LIMIT 20
+    """)
+    runs = cursor.fetchall()
+
+    if not runs:
+        print("No trace runs found.")
+        return 0
+
+    print(f"Recent trace runs ({len(runs)}):")
+    print()
+    print(f"{'RUN_ID':<40} {'STATUS':<10} {'EXIT':<5} {'COMMAND':<40}")
+    print("-" * 100)
+
+    for row in runs:
+        run_id = row[0][:36] if row[0] else "?"
+        command = (row[1] or "")[:40]
+        status = row[4] or "?"
+        exit_code = str(row[5]) if row[5] is not None else "?"
+        print(f"{run_id:<40} {status:<10} {exit_code:<5} {command:<40}")
+
+    print()
+    print("Use './loom trace show <run_id>' for details.")
+    return 0
+
+
+def cmd_trace_show(run_id):
+    """Show call tree for a trace run."""
+    cs = CodeStore('.loom/store.db')
+
+    # Get run info
+    run = cs.get_trace_run(run_id)
+    if not run:
+        # Try partial match
+        cursor = cs.conn.execute(
+            "SELECT run_id FROM trace_runs WHERE run_id LIKE ?",
+            (f"{run_id}%",)
+        )
+        matches = cursor.fetchall()
+        if len(matches) == 1:
+            run_id = matches[0][0]
+            run = cs.get_trace_run(run_id)
+        elif len(matches) > 1:
+            print(f"Ambiguous run_id '{run_id}'. Matches:")
+            for m in matches[:5]:
+                print(f"  {m[0]}")
+            return 1
+        else:
+            print(f"Trace run not found: {run_id}")
+            return 1
+
+    print(f"Trace Run: {run['run_id']}")
+    print(f"Command:   {run.get('command', 'N/A')}")
+    print(f"Status:    {run.get('status', 'N/A')}")
+    print(f"Exit Code: {run.get('exit_code', 'N/A')}")
+    print(f"Started:   {run.get('started_at', 'N/A')}")
+    print(f"Ended:     {run.get('ended_at', 'N/A')}")
+    print()
+
+    # Get calls for this run
+    calls = cs.get_calls_for_run(run_id, include_args=True)
+
+    if not calls:
+        print("No traced function calls recorded.")
+        return 0
+
+    print(f"Call Tree ({len(calls)} calls):")
+    print("-" * 80)
+
+    for call in calls:
+        depth = call.get('depth', 0)
+        indent = "  " * depth
+        func = call.get('function_name', '?').split('.')[-1]  # Short name
+        full_func = call.get('function_name', '?')
+        duration = call.get('duration_ms', 0)
+        duration_str = f"{duration:.1f}ms" if duration else "?"
+
+        # Format args summary
+        args_json = call.get('args_json', '[]')
+        kwargs_json = call.get('kwargs_json', '{}')
+        try:
+            import json
+            args = json.loads(args_json) if args_json else []
+            kwargs = json.loads(kwargs_json) if kwargs_json else {}
+            args_summary = []
+            if args:
+                args_summary.extend([_truncate(repr(a), 20) for a in args[:3]])
+            if kwargs:
+                for k, v in list(kwargs.items())[:2]:
+                    args_summary.append(f"{k}={_truncate(repr(v), 15)}")
+            args_str = ", ".join(args_summary) if args_summary else ""
+        except:
+            args_str = ""
+
+        # Format return/exception
+        result_str = ""
+        if call.get('exception_type'):
+            result_str = f" -> ERROR: {call['exception_type']}"
+        elif call.get('return_value_json'):
+            try:
+                ret = json.loads(call['return_value_json'])
+                ret_repr = _truncate(repr(ret), 30)
+                result_str = f" -> {ret_repr}"
+            except:
+                result_str = " -> ?"
+
+        # Print call line
+        file_info = ""
+        if call.get('file_path'):
+            file_path = call['file_path'].split('/')[-1]  # Just filename
+            lineno = call.get('line_number', '?')
+            file_info = f" [{file_path}:{lineno}]"
+
+        print(f"{indent}{func}({args_str}){result_str} [{duration_str}]{file_info}")
+
+    print()
+
+    # Summary stats
+    total_time = sum(c.get('duration_ms', 0) or 0 for c in calls if c.get('depth', 0) == 0)
+    exceptions = [c for c in calls if c.get('exception_type')]
+    print(f"Total top-level time: {total_time:.1f}ms")
+    print(f"Exceptions: {len(exceptions)}")
+
+    return 0
+
+
+def cmd_trace_calls(function_name):
+    """Show all calls to a specific function across runs."""
+    cs = CodeStore('.loom/store.db')
+
+    # Find calls matching the function name
+    cursor = cs.conn.execute("""
+        SELECT c.call_id, c.run_id, c.function_name, c.duration_ms,
+               c.args_json, c.return_value_json, c.exception_type,
+               c.called_at, r.command
+        FROM trace_calls c
+        JOIN trace_runs r ON c.run_id = r.run_id
+        WHERE c.function_name LIKE ?
+        ORDER BY c.called_at DESC
+        LIMIT 50
+    """, (f"%{function_name}%",))
+
+    calls = cursor.fetchall()
+
+    if not calls:
+        print(f"No calls found matching: {function_name}")
+        return 0
+
+    print(f"Calls matching '{function_name}' ({len(calls)}):")
+    print()
+
+    for row in calls:
+        call_id, run_id, func_name, duration, args_json, ret_json, exc_type, called_at, command = row
+
+        print(f"  {func_name}")
+        print(f"    Run: {run_id[:16]}... ({command[:30] if command else 'N/A'})")
+        print(f"    Time: {called_at}")
+        print(f"    Duration: {duration:.2f}ms" if duration else "    Duration: N/A")
+
+        # Args
+        if args_json:
+            try:
+                import json
+                args = json.loads(args_json)
+                if args:
+                    args_repr = repr(args)[:60]
+                    print(f"    Args: {args_repr}")
+            except:
+                pass
+
+        # Result
+        if exc_type:
+            print(f"    Result: ERROR - {exc_type}")
+        elif ret_json:
+            try:
+                import json
+                ret = json.loads(ret_json)
+                ret_repr = repr(ret)[:60]
+                print(f"    Result: {ret_repr}")
+            except:
+                pass
+
+        print()
+
+    return 0
+
+
+def _truncate(s, max_len):
+    """Truncate a string to max_len."""
+    s = str(s)
+    if len(s) > max_len:
+        return s[:max_len-3] + "..."
+    return s
+
+
+def cmd_check_hypothesis(note_id, run_id):
+    """Check a hypothesis against trace data."""
+    cs = CodeStore('.loom/store.db')
+
+    # Resolve partial IDs
+    # Check note_id
+    note = cs.get_note(note_id)
+    if not note:
+        # Try partial match
+        cursor = cs.conn.execute(
+            "SELECT id FROM notes WHERE id LIKE ? AND type = 'hypothesis'",
+            (f"{note_id}%",)
+        )
+        matches = cursor.fetchall()
+        if len(matches) == 1:
+            note_id = matches[0][0]
+        elif len(matches) > 1:
+            print(f"Ambiguous hypothesis ID '{note_id}'. Matches:")
+            for m in matches[:5]:
+                print(f"  {m[0]}")
+            return 1
+        else:
+            print(f"Hypothesis not found: {note_id}")
+            return 1
+
+    # Check run_id
+    run = cs.get_trace_run(run_id)
+    if not run:
+        cursor = cs.conn.execute(
+            "SELECT run_id FROM trace_runs WHERE run_id LIKE ?",
+            (f"{run_id}%",)
+        )
+        matches = cursor.fetchall()
+        if len(matches) == 1:
+            run_id = matches[0][0]
+        elif len(matches) > 1:
+            print(f"Ambiguous run_id '{run_id}'. Matches:")
+            for m in matches[:5]:
+                print(f"  {m[0]}")
+            return 1
+        else:
+            print(f"Trace run not found: {run_id}")
+            return 1
+
+    # Run the check
+    result = cs.check_hypothesis(note_id, run_id)
+
+    if 'error' in result:
+        print(f"Error: {result['error']}")
+        return 1
+
+    # Print the summary
+    print("=" * 70)
+    print("HYPOTHESIS CHECK")
+    print("=" * 70)
+    print()
+    print(result['summary'])
+    print()
+
+    # Print detailed evidence if there are calls
+    has_calls = any(e['call_count'] > 0 for e in result['evidence'])
+    if has_calls:
+        print("-" * 70)
+        print("DETAILED CALL DATA")
+        print("-" * 70)
+        for e in result['evidence']:
+            if e['call_count'] > 0:
+                print(f"\n{e['entity']} ({e['entity_kind']}):")
+                for i, call in enumerate(e['calls'][:5]):  # Show first 5
+                    print(f"  [{i+1}] {call.get('function', 'N/A')}")
+                    if 'args' in call:
+                        print(f"      Args: {call['args'][:80]}...")
+                    if 'returned' in call:
+                        print(f"      Returned: {call['returned'][:80]}")
+                    if 'exception' in call:
+                        print(f"      EXCEPTION: {call['exception']}")
+                    if 'duration_ms' in call and call['duration_ms']:
+                        print(f"      Duration: {call['duration_ms']:.2f}ms")
+                if len(e['calls']) > 5:
+                    print(f"  ... and {len(e['calls']) - 5} more calls")
+
+    print()
+    print("=" * 70)
+    print("Use './loom resolve {note_id} yes' or 'no' to record your conclusion.")
+    print("=" * 70)
+
+    cs.close()
+    return 0
+
+
+def cmd_test(pytest_args):
+    """Run pytest with automatic Loom tracing.
+
+    This is THE single command for testing with smart test selection
+    and automatic trace data on failures. Uses failure-focused mode
+    for minimal overhead (<1.5x) on passing tests.
+
+    Behavior:
+    1. Re-ingest any changed files (quick update)
+    2. Detect changed entities since last test run
+    3. Map to impacted tests
+    4. Run impacted tests with tracing enabled (failure-focused mode)
+    5. If impacted tests pass, run full suite
+    6. If any tests fail, traces are auto-persisted with enhanced output
+    7. Record this as a test run for next comparison
+
+    Args:
+        pytest_args: Arguments to pass to pytest (typically empty for auto mode)
+    """
+    import subprocess
+    import time
+    from pathlib import Path
+    from collections import defaultdict
+
+    loom_dir = os.path.dirname(os.path.abspath(__file__))
+    db_path = os.path.join('.loom', 'store.db')
+
+    # Check if plugin exists
+    conftest_path = os.path.join(loom_dir, 'loom_pytest_plugin.py')
+    if not os.path.exists(conftest_path):
+        print(f"Error: Loom pytest plugin not found at {conftest_path}")
+        return 1
+
+    # Initialize CodeStore
+    cs = CodeStore(db_path)
+
+    # Setup environment for pytest
+    env = os.environ.copy()
+    pythonpath = env.get('PYTHONPATH', '')
+    if pythonpath:
+        env['PYTHONPATH'] = f"{loom_dir}:{pythonpath}"
+    else:
+        env['PYTHONPATH'] = loom_dir
+
+    # Parse mode from args
+    mode = 'fail'  # Default to failure-focused mode for low overhead
+    filtered_args = []
+    i = 0
+    while i < len(pytest_args):
+        if pytest_args[i] == '--mode' and i + 1 < len(pytest_args):
+            mode = pytest_args[i + 1]
+            i += 2
+        elif pytest_args[i].startswith('--mode='):
+            mode = pytest_args[i].split('=', 1)[1]
+            i += 1
+        else:
+            filtered_args.append(pytest_args[i])
+            i += 1
+    pytest_args = filtered_args
+
+    # Step 1: Detect changed files (before re-ingesting)
+    changed_files = cs.get_changed_files()
+
+    # Step 2: Get changed entities BEFORE we update file tracking
+    changed_entities = cs.get_changed_entities()
+
+    # Step 3: Re-ingest changed files (updates entity definitions and file tracking)
+    if changed_files:
+        print(f"Re-ingesting {len(changed_files)} changed file(s)...")
+        sys.stdout.flush()
+
+        for fp, change_type in changed_files:
+            if change_type != 'deleted' and Path(fp).exists():
+                parser = cs.parser_registry.get_parser(Path(fp))
+                if parser:
+                    parse_result = parser.parse_file(Path(fp))
+                    if not parse_result.errors:
+                        for entity in parse_result.entities:
+                            cs.add_entity(
+                                name=entity["name"],
+                                kind=entity["kind"],
+                                code=entity.get("code"),
+                                intent=entity.get("intent"),
+                                metadata=entity.get("metadata"),
+                            )
+                        cs.track_file(fp)
+
+    last_test_run = cs.get_latest_test_run()
+    impacted_tests = cs.get_impacted_tests(changed_entities) if changed_entities else []
+
+    # Group changed entities by file for display
+    entities_by_file = defaultdict(list)
+    for entity in changed_entities:
+        fp = entity.get('file_path', 'unknown')
+        if '/' in fp:
+            fp = fp.rsplit('/', 1)[-1]
+        entities_by_file[fp].append(entity.get('name', '').split('.')[-1])
+
+    if changed_entities:
+        change_summary = []
+        for fp, names in entities_by_file.items():
+            if len(names) <= 3:
+                change_summary.append(f"{fp} ({', '.join(names)})")
+            else:
+                change_summary.append(f"{fp} ({', '.join(names[:3])}, ...)")
+        print(f"Changes detected: {', '.join(change_summary)}")
+    else:
+        print("No changes detected since last test run.")
+    sys.stdout.flush()
+
+    # Count impacted test files
+    test_file_set = set()
+    for test_name in impacted_tests:
+        if '::' in test_name:
+            test_file_set.add(test_name.split('::')[0])
+        elif test_name.endswith('.py'):
+            test_file_set.add(test_name)
+        else:
+            test_file_set.add(test_name + '.py')
+
+    if impacted_tests:
+        print(f"Impacted tests: {len(impacted_tests)} across {len(test_file_set)} file(s)")
+    else:
+        print("No impacted tests detected (running full suite).")
+
+    print()
+    sys.stdout.flush()
+
+    # Base pytest command with optimized tracing
+    # Uses --loom-mode=fail by default for <1.5x overhead on passing tests
+    base_cmd = [
+        sys.executable, '-m', 'pytest',
+        '-p', 'loom_pytest_plugin',
+        '--loom-trace',
+        f'--loom-mode={mode}',  # failure-focused mode for low overhead
+        '-v',
+    ]
+    base_cmd.extend(pytest_args)
+
+    # Step 4: Run impacted tests first (if any)
+    if impacted_tests and not pytest_args:
+        print("Running impacted tests...")
+        sys.stdout.flush()
+        start_time = time.time()
+
+        impacted_cmd = base_cmd.copy()
+
+        valid_tests = []
+        for test_name in impacted_tests:
+            if '::' in test_name:
+                test_file = test_name.split('::')[0]
+                if Path(test_file).exists():
+                    valid_tests.append(test_name)
+            elif test_name.endswith('.py') and Path(test_name).exists():
+                valid_tests.append(test_name)
+            else:
+                possible_paths = [
+                    f"{test_name}.py",
+                    f"tests/{test_name}.py",
+                    f"test/{test_name}.py",
+                ]
+                for pp in possible_paths:
+                    if Path(pp).exists():
+                        valid_tests.append(pp)
+                        break
+
+        if valid_tests:
+            impacted_cmd.extend(valid_tests[:20])
+
+            result = subprocess.run(impacted_cmd, env=env)
+            elapsed = time.time() - start_time
+
+            if result.returncode != 0:
+                print()
+                _show_trace_summary(cs, failed=True)
+                print(f"\n{len(valid_tests)} impacted test(s) checked ({elapsed:.1f}s). Stopping.")
+                cs.close()
+                return result.returncode
+
+            print(f"{len(valid_tests)}/{len(valid_tests)} passed ({elapsed:.1f}s)")
+            print()
+
+    # Step 5: Run full suite
+    print("Running full suite...")
+    sys.stdout.flush()
+    start_time = time.time()
+
+    result = subprocess.run(base_cmd, env=env)
+    elapsed = time.time() - start_time
+
+    if result.returncode != 0:
+        print()
+        _show_trace_summary(cs, failed=True)
+
+    print(f"\nFull suite completed ({elapsed:.1f}s)")
+
+    cs.close()
+    return result.returncode
+
+
+def cmd_failure_log(args):
+    """Log a failed fix attempt."""
+    if not args:
+        print("Error: Message is required")
+        print("Usage: loom failure-log <message> [--context TEXT] [--entity TEXT] [--file PATH] [--reason TEXT] [--error TEXT] [--tag TAG]")
+        return 1
+
+    # Parse arguments
+    message = None
+    context = None
+    entity = None
+    file_path = None
+    reason = None
+    error = None
+    tags = []
+
+    i = 0
+    while i < len(args):
+        if args[i] == '--context' and i + 1 < len(args):
+            context = args[i + 1]
+            i += 2
+        elif args[i] == '--entity' and i + 1 < len(args):
+            entity = args[i + 1]
+            i += 2
+        elif args[i] == '--file' and i + 1 < len(args):
+            file_path = args[i + 1]
+            i += 2
+        elif args[i] == '--reason' and i + 1 < len(args):
+            reason = args[i + 1]
+            i += 2
+        elif args[i] == '--error' and i + 1 < len(args):
+            error = args[i + 1]
+            i += 2
+        elif args[i] == '--tag' and i + 1 < len(args):
+            tags.append(args[i + 1])
+            i += 2
+        elif not args[i].startswith('--'):
+            if message is None:
+                message = args[i]
+            else:
+                message += ' ' + args[i]
+            i += 1
+        else:
+            i += 1
+
+    if not message:
+        print("Error: Message is required")
+        return 1
+
+    cs = CodeStore('.loom/store.db')
+
+    log_id = cs.log_failure(
+        attempted_fix=message,
+        context=context,
+        entity_name=entity,
+        file_path=file_path,
+        failure_reason=reason,
+        related_error=error,
+        tags=tags if tags else None
+    )
+
+    print(f"Logged failure #{log_id}")
+    if entity:
+        print(f"  Entity: {entity}")
+    if file_path:
+        print(f"  File: {file_path}")
+    if context:
+        print(f"  Context: {context}")
+    print(f"  Fix: {message}")
+    if reason:
+        print(f"  Reason: {reason}")
+    if tags:
+        print(f"  Tags: {', '.join(tags)}")
+
+    cs.close()
+    return 0
+
+
+def cmd_attempted_fixes(args):
+    """Query past failed fix attempts."""
+    if args and args[0] == 'recent':
+        return cmd_attempted_fixes_recent(args[1:])
+    elif args and args[0] == 'clear':
+        return cmd_attempted_fixes_clear(args[1:])
+
+    # Parse query options
+    entity = None
+    file_path = None
+    tags = []
+    search = None
+    limit = 50
+
+    i = 0
+    while i < len(args):
+        if args[i] == '--entity' and i + 1 < len(args):
+            entity = args[i + 1]
+            i += 2
+        elif args[i] == '--file' and i + 1 < len(args):
+            file_path = args[i + 1]
+            i += 2
+        elif args[i] == '--tag' and i + 1 < len(args):
+            tags.append(args[i + 1])
+            i += 2
+        elif args[i] == '--search' and i + 1 < len(args):
+            search = args[i + 1]
+            i += 2
+        elif args[i] == '--limit' and i + 1 < len(args):
+            limit = int(args[i + 1])
+            i += 2
+        else:
+            i += 1
+
+    cs = CodeStore('.loom/store.db')
+
+    logs = cs.get_failure_logs(
+        entity_name=entity,
+        file_path=file_path,
+        tags=tags if tags else None,
+        context_search=search,
+        limit=limit
+    )
+
+    if not logs:
+        print("No failures found matching criteria.")
+        cs.close()
+        return 0
+
+    print(f"\nFound {len(logs)} failed attempt(s):\n")
+
+    for i, log in enumerate(logs, 1):
+        print(f"{i}. [{log['timestamp'][:19]}] ID #{log['id']}")
+        if log.get('entity_name'):
+            print(f"   Entity: {log['entity_name']}")
+        if log.get('file_path'):
+            print(f"   File: {log['file_path']}")
+        if log.get('context'):
+            print(f"   Context: {log['context']}")
+        print(f"   Tried: {log['attempted_fix']}")
+        if log.get('failure_reason'):
+            print(f"   Failed: {log['failure_reason']}")
+        if log.get('related_error'):
+            error_preview = log['related_error'][:100] + '...' if len(log['related_error']) > 100 else log['related_error']
+            print(f"   Error: {error_preview}")
+        if log.get('tags'):
+            print(f"   Tags: {', '.join(log['tags'])}")
+        print()
+
+    cs.close()
+    return 0
+
+
+def cmd_attempted_fixes_recent(args):
+    """Show recent failure logs."""
+    days = 7
+    limit = 20
+
+    i = 0
+    while i < len(args):
+        if args[i] == '--days' and i + 1 < len(args):
+            days = int(args[i + 1])
+            i += 2
+        elif args[i] == '--limit' and i + 1 < len(args):
+            limit = int(args[i + 1])
+            i += 2
+        else:
+            i += 1
+
+    cs = CodeStore('.loom/store.db')
+    logs = cs.get_recent_failures(days=days, limit=limit)
+
+    if not logs:
+        print(f"No failures in the last {days} day(s).")
+        cs.close()
+        return 0
+
+    print(f"\nRecent failures (last {days} day(s)):\n")
+
+    for i, log in enumerate(logs, 1):
+        timestamp = log['timestamp'][:19] if log.get('timestamp') else '?'
+        fix = log.get('attempted_fix', '?')
+        if len(fix) > 60:
+            fix = fix[:57] + '...'
+        print(f"{i}. {fix}")
+        print(f"   {timestamp}")
+        if log.get('file_path'):
+            print(f"   File: {log['file_path']}")
+        print()
+
+    cs.close()
+    return 0
+
+
+def cmd_attempted_fixes_clear(args):
+    """Clear old failure logs."""
+    days = 30
+
+    i = 0
+    while i < len(args):
+        if args[i] == '--days' and i + 1 < len(args):
+            days = int(args[i + 1])
+            i += 2
+        else:
+            i += 1
+
+    cs = CodeStore('.loom/store.db')
+    count = cs.clear_old_failures(days=days)
+
+    print(f"Deleted {count} failure log(s) older than {days} day(s)")
+
+    cs.close()
+    return 0
+
+
+def _show_trace_summary(cs, failed=True):
+    """Show trace-enhanced summary for failures."""
+    from collections import defaultdict
+
+    # Get the most recent failed calls
+    failed_calls = cs.get_failed_calls(limit=20)
+
+    if not failed_calls:
+        return
+
+    print("--- Trace Summary ---")
+
+    # Group calls by function name
+    calls_by_func = defaultdict(list)
+    for call in failed_calls:
+        func_name = call.get('function_name', 'unknown')
+        # Get short name
+        if '.' in func_name:
+            short_name = func_name.rsplit('.', 1)[-1]
+        else:
+            short_name = func_name
+        calls_by_func[short_name].append(call)
+
+    for func_name, calls in list(calls_by_func.items())[:5]:
+        print(f"{func_name}() called {len(calls)} time(s)")
+
+        for i, call in enumerate(calls[:3], 1):
+            # Format args
+            args_str = call.get('args_json', '') or ''
+            if len(args_str) > 50:
+                args_str = args_str[:47] + '...'
+
+            duration = call.get('duration_ms', 0) or 0
+
+            if call.get('exception_type'):
+                exc_type = call.get('exception_type', '?')
+                exc_msg = call.get('exception_message', '')
+                if len(exc_msg) > 40:
+                    exc_msg = exc_msg[:37] + '...'
+                print(f"  Call {i}: {args_str} -> EXCEPTION: {exc_type}('{exc_msg}')")
+                file_path = call.get('file_path', '?')
+                if '/' in file_path:
+                    file_path = file_path.rsplit('/', 1)[-1]
+                lineno = call.get('line_number', '?')
+                print(f"    at {file_path}:{lineno}")
+            else:
+                ret_val = call.get('return_value_json', '') or ''
+                if len(ret_val) > 30:
+                    ret_val = ret_val[:27] + '...'
+                print(f"  Call {i}: {args_str} -> {ret_val} ({duration:.1f}ms)")
+
+    # Show exception details
+    exc_calls = [c for c in failed_calls if c.get('exception_type')]
+    if exc_calls:
+        print()
+        print("--- Exception ---")
+        last_exc = exc_calls[0]
+        print(f"{last_exc.get('exception_type', '?')}: {last_exc.get('exception_message', '')}")
+
+        # Show abbreviated traceback
+        tb = last_exc.get('exception_traceback', '')
+        if tb:
+            tb_lines = tb.strip().split('\n')
+            # Show last few relevant lines
+            for line in tb_lines[-6:]:
+                print(f"  {line}")
+
+
+def main():
+    from pathlib import Path
+
+    # Parse global --project flag before command processing
+    project_path = None
+    argv_filtered = [sys.argv[0]]  # Keep program name
+    i = 1
+    while i < len(sys.argv):
+        if sys.argv[i] == '--project' and i + 1 < len(sys.argv):
+            project_path = sys.argv[i + 1]
+            i += 2
+        elif sys.argv[i].startswith('--project='):
+            project_path = sys.argv[i].split('=', 1)[1]
+            i += 1
+        else:
+            argv_filtered.append(sys.argv[i])
+            i += 1
+
+    # Set project context if provided
+    if project_path:
+        target = Path(project_path).resolve()
+        if (target / ".loom" / "store.db").exists():
+            set_active_project(target)
+        else:
+            print(f"Warning: No Loom database found at {target}/.loom/store.db")
+            print(f"Run './loom ingest {project_path}' first.")
+
+    # Use filtered argv
+    sys.argv = argv_filtered
+
+    if len(sys.argv) < 2 or sys.argv[1] in ('--help', '-h', 'help'):
+        print(__doc__)
+        return
+
+    cmd = sys.argv[1]
+    args = sys.argv[2:]
+
+    # Project management commands
+    if cmd == 'project':
+        if not args or args[0] == 'show':
+            active = get_active_project()
+            if active:
+                print(f"Active project: {active}")
+            else:
+                print("No active project set.")
+                print("Use './loom ingest <path>' to ingest a project, or")
+                print("use '--project <path>' with any command to set one.")
+        elif args[0] == 'set':
+            if len(args) > 1:
+                target = Path(args[1]).resolve()
+            else:
+                target = Path.cwd()
+            if (target / ".loom" / "store.db").exists():
+                set_active_project(target)
+                print(f"Active project set to: {target}")
+            else:
+                print(f"Error: No Loom database at {target}/.loom/store.db")
+                print(f"Run './loom ingest {target}' first.")
+        elif args[0] == 'clear':
+            clear_active_project()
+            print("Active project cleared.")
+        else:
+            print("Usage: loom project [show|set [path]|clear]")
+        return
+
+    if cmd == 'ingest' and args:
+        cmd_ingest(args[0])
+    elif cmd == 'query' and args:
+        cmd_query(' '.join(args))
+    elif cmd == 'languages':
+        cmd_languages()
+    elif cmd == 'info':
+        cmd_info()
+    elif cmd == 'understand' and args:
+        print(understand(' '.join(args)))
+    elif cmd == 'impact' and args:
+        print(what_breaks_if_i_change(args[0]))
+    elif cmd == 'callers' and args:
+        print(what_calls(args[0]))
+    elif cmd == 'tests' and args:
+        print(which_tests(args[0]))
+    elif cmd == 'class' and args:
+        print(explain_class(args[0]))
+    elif cmd == 'module' and args:
+        print(explain_module(args[0]))
+    elif cmd == 'debug' and args:
+        error = args[0]
+        file = args[1] if len(args) > 1 else None
+        print(debug_context(error, file))
+    elif cmd == 'stats':
+        from loom_base import _find_store
+        active = get_active_project()
+        if active:
+            print(f'Project: {active}')
+        cs = _find_store()
+        if not cs:
+            print("Error: No Loom database found.")
+            print("Run './loom ingest <path>' to create one.")
+            return
+        entities = cs.find_entities()
+        from collections import Counter
+        types = Counter(e.get('kind') for e in entities)
+        print(f'Entities: {len(entities)}')
+        for t, c in types.most_common():
+            print(f'  {t}: {c}')
+        cs.close()
+    elif cmd == 'usage':
+        print(usage_report())
+    elif cmd == 'note' and args:
+        note_id = add_finding(' '.join(args))
+        print(f"Note added: {note_id}")
+    elif cmd == 'intent' and len(args) >= 2:
+        entity = args[0]
+        why = ' '.join(args[1:])
+        note_id = add_intent(entity, why)
+        print(f"Intent documented: {note_id}")
+    elif cmd == 'hypothesis' and args:
+        # Parse --about flag for linking to entities
+        about_entities = []
+        hypothesis_parts = []
+        i = 0
+        while i < len(args):
+            if args[i] == '--about' and i + 1 < len(args):
+                about_entities.append(args[i + 1])
+                i += 2
+            else:
+                hypothesis_parts.append(args[i])
+                i += 1
+        hypothesis_text = ' '.join(hypothesis_parts)
+        note_id = add_hypothesis(hypothesis_text, related_to=about_entities if about_entities else None)
+        print(f"Hypothesis recorded: {note_id}")
+        if about_entities:
+            print(f"Linked to: {', '.join(about_entities)}")
+        print("Use './loom resolve <note_id> yes|no' to confirm or refute.")
+        print("Use './loom check-hypothesis <note_id> <trace_run_id>' to check against trace data.")
+    elif cmd == 'resolve' and len(args) >= 2:
+        note_id = args[0]
+        confirmed = args[1].lower() in ('yes', 'y', 'true', '1', 'confirmed')
+        success = resolve_hypothesis(note_id, confirmed)
+        status = 'confirmed' if confirmed else 'refuted'
+        if success:
+            print(f"Hypothesis {note_id} marked as: {status}")
+        else:
+            print(f"Error: Note not found: {note_id}")
+    elif cmd == 'check-hypothesis' and len(args) >= 2:
+        sys.exit(cmd_check_hypothesis(args[0], args[1]))
+    elif cmd == 'about' and args:
+        print(whats_known_about(args[0]))
+    elif cmd == 'search-notes' and args:
+        print(search_knowledge(' '.join(args)))
+    elif cmd == 'note-stats':
+        print(knowledge_stats())
+    elif cmd == 'architecture':
+        print(architecture())
+    elif cmd == 'central':
+        limit = int(args[0]) if args else 10
+        print(central_entities(limit))
+    elif cmd == 'orphans':
+        print(orphan_entities())
+    elif cmd == 'path' and len(args) >= 2:
+        print(find_path(args[0], args[1]))
+    elif cmd == 'update-note' and len(args) >= 2:
+        note_id = args[0]
+        new_content = ' '.join(args[1:])
+        cs = CodeStore('.loom/store.db')
+        success = cs.update_note(note_id, content=new_content)
+        if success:
+            print(f"Note updated: {note_id}")
+        else:
+            print(f"Error: Note not found: {note_id}")
+    elif cmd == 'delete-note' and args:
+        note_id = args[0]
+        cs = CodeStore('.loom/store.db')
+        success = cs.delete_note(note_id)
+        if success:
+            print(f"Note deleted: {note_id}")
+        else:
+            print(f"Error: Note not found: {note_id}")
+    elif cmd == 'failure-log':
+        sys.exit(cmd_failure_log(args))
+    elif cmd == 'attempted-fixes':
+        sys.exit(cmd_attempted_fixes(args))
+    elif cmd == 'trace':
+        # Trace subcommands
+        if not args:
+            print("Usage: loom trace <run|list|show|calls> [args]")
+            return
+        subcmd = args[0]
+        subargs = args[1:]
+        if subcmd == 'run' and subargs:
+            sys.exit(cmd_trace_run(' '.join(subargs)))
+        elif subcmd == 'list':
+            cmd_trace_list()
+        elif subcmd == 'show' and subargs:
+            cmd_trace_show(subargs[0])
+        elif subcmd == 'calls' and subargs:
+            cmd_trace_calls(subargs[0])
+        else:
+            print("Usage: loom trace <run|list|show|calls> [args]")
+    elif cmd == 'consolidate' and len(args) >= 3:
+        # Last argument is the title, rest are note IDs
+        note_ids = args[:-1]
+        new_title = args[-1]
+        cs = CodeStore('.loom/store.db')
+        try:
+            new_id = cs.consolidate_notes(note_ids, new_title, summarize=True)
+            print(f"Notes consolidated into: {new_id}")
+            print(f"Title: {new_title}")
+            print(f"Merged {len(note_ids)} note(s), originals deleted.")
+        except ValueError as e:
+            print(f"Error: {e}")
+    elif cmd == 'test':
+        # Run pytest with automatic tracing
+        sys.exit(cmd_test(args))
+    elif cmd == 'clusters' and args:
+        # File cohesion analysis for refactoring
+        from refactor import analyze_clusters, format_clusters_report
+        import json
+        file_path = args[0]
+        use_json = '--json' in args
+        analysis = analyze_clusters('.loom/store.db', file_path)
+        if use_json:
+            print(json.dumps(analysis, indent=2))
+        else:
+            print(format_clusters_report(analysis))
+    elif cmd == 'extract' and args:
+        # Extract entities to new module (preview mode)
+        from refactor import preview_extraction, format_extraction_preview
+        import json as json_module
+
+        # Parse arguments
+        entity_names = []
+        target_module = None
+        use_json = False
+        preview_mode = False
+
+        i = 0
+        while i < len(args):
+            if args[i] == '--to' and i + 1 < len(args):
+                target_module = args[i + 1]
+                i += 2
+            elif args[i] == '--preview':
+                preview_mode = True
+                i += 1
+            elif args[i] == '--json':
+                use_json = True
+                i += 1
+            elif not args[i].startswith('--'):
+                entity_names.append(args[i])
+                i += 1
+            else:
+                i += 1
+
+        if not entity_names:
+            print("Error: No entity names provided")
+            print("Usage: ./loom extract <entity1> [entity2...] --preview")
+            print("       ./loom extract <entities...> --to <module> --preview")
+            sys.exit(1)
+
+        if not preview_mode:
+            print("Error: --preview flag is required (execution not yet implemented)")
+            print("Usage: ./loom extract <entity1> [entity2...] --preview")
+            sys.exit(1)
+
+        result = preview_extraction('.loom/store.db', entity_names, target_module)
+
+        if use_json:
+            print(json_module.dumps(result, indent=2))
+        else:
+            print(format_extraction_preview(result))
+    elif cmd == 'todo':
+        # TODO management - delegate to cli.py for full argparse support
+        from cli import main as cli_main
+        # Reconstruct sys.argv for cli.py
+        sys.argv = ['loom', 'todo'] + args
+        sys.exit(cli_main())
+    else:
+        print(__doc__)
+
+if __name__ == '__main__':
+    main()
