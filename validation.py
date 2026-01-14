@@ -72,9 +72,9 @@ class CodeValidator:
         """Run all validations and return combined result."""
         result = ValidationResult()
 
-        # Run each validation
+        # Run validations for each cross-file ref type
         dom_result = self.validate_dom_references()
-        import_result = self.validate_imports()
+        import_result = self.validate_unresolved_imports()
 
         # Combine results
         result.errors.extend(dom_result.errors)
@@ -88,6 +88,76 @@ class CodeValidator:
             'imports': import_result.stats,
             'total_errors': len(result.errors),
             'total_warnings': len(result.warnings)
+        }
+
+        return result
+
+    def validate_unresolved_imports(self) -> ValidationResult:
+        """Validate that unresolved import statements reference existing files.
+
+        Reads from cross_file_refs table where ref_type = 'imports'.
+        These are imports where the target module wasn't found during ingestion.
+        """
+        result = ValidationResult()
+
+        # Get all unresolved imports from cross_file_refs
+        cursor = self.store.conn.execute("""
+            SELECT
+                cfr.target_name,
+                cfr.source_file,
+                cfr.line_number,
+                cfr.verifiable,
+                cfr.verification_reason,
+                cfr.metadata,
+                e.name as source_entity_name
+            FROM cross_file_refs cfr
+            JOIN entities e ON cfr.source_entity_id = e.id
+            WHERE cfr.ref_type = 'imports'
+        """)
+
+        total_refs = 0
+        relative_imports = 0
+        missing_imports = 0
+        external_imports = 0
+
+        for row in cursor.fetchall():
+            total_refs += 1
+            import_path = row['target_name']
+            source_file = row['source_file'] or 'unknown'
+            line = row['line_number'] or 0
+            source_entity = row['source_entity_name']
+
+            # Check if it's a relative import (can be validated)
+            if import_path.startswith('./') or import_path.startswith('../'):
+                relative_imports += 1
+
+                # Resolve the import path relative to source file
+                if source_file != 'unknown':
+                    source_dir = Path(source_file).parent
+                    resolved = self._resolve_import(source_dir, import_path)
+
+                    if resolved is None:
+                        missing_imports += 1
+                        result.errors.append(ValidationIssue(
+                            level='error',
+                            category='import',
+                            message=f"Import '{import_path}' not found",
+                            file=source_file,
+                            line=line,
+                            details={
+                                'import_path': import_path,
+                                'source_module': source_entity,
+                            }
+                        ))
+            else:
+                # External/node_modules import - not validated
+                external_imports += 1
+
+        result.stats = {
+            'total_unresolved': total_refs,
+            'relative_imports': relative_imports,
+            'missing_imports': missing_imports,
+            'external_imports': external_imports
         }
 
         return result
@@ -199,85 +269,6 @@ class CodeValidator:
 
         return result
 
-    def validate_imports(self) -> ValidationResult:
-        """Validate that import statements reference existing files.
-
-        Checks:
-        - Relative imports (./foo, ../bar) resolve to existing files
-        - Reports missing files as errors
-        - Reports node_modules/external imports as info (not validated)
-        """
-        result = ValidationResult()
-
-        # Get all import relationships
-        cursor = self.store.conn.execute("""
-            SELECT
-                src.name as from_entity,
-                tgt.name as to_entity,
-                r.metadata
-            FROM relationships r
-            JOIN entities src ON r.source_id = src.id
-            JOIN entities tgt ON r.target_id = tgt.id
-            WHERE r.relation = 'imports'
-        """)
-
-        total_imports = 0
-        relative_imports = 0
-        missing_imports = 0
-        external_imports = 0
-
-        for row in cursor.fetchall():
-            total_imports += 1
-            from_module = row['from_entity']
-            import_path = row['to_entity']
-            metadata = json.loads(row['metadata']) if row['metadata'] else {}
-
-            # Get the source file path
-            file_cursor = self.store.conn.execute("""
-                SELECT file FROM entities WHERE name = ? AND kind = 'module'
-            """, (from_module,))
-            file_row = file_cursor.fetchone()
-
-            if not file_row:
-                continue
-
-            source_file = Path(file_row['file'])
-
-            # Check if it's a relative import
-            if import_path.startswith('./') or import_path.startswith('../'):
-                relative_imports += 1
-
-                # Resolve the import path
-                source_dir = source_file.parent
-                resolved = self._resolve_import(source_dir, import_path)
-
-                if resolved is None:
-                    missing_imports += 1
-                    result.errors.append(ValidationIssue(
-                        level='error',
-                        category='import',
-                        message=f"Import '{import_path}' not found",
-                        file=str(source_file),
-                        line=0,  # TODO: track line numbers for imports
-                        details={
-                            'import_path': import_path,
-                            'source_module': from_module,
-                            'specifiers': metadata.get('specifiers', [])
-                        }
-                    ))
-            else:
-                # External/node_modules import - not validated
-                external_imports += 1
-
-        result.stats = {
-            'total_imports': total_imports,
-            'relative_imports': relative_imports,
-            'missing_imports': missing_imports,
-            'external_imports': external_imports
-        }
-
-        return result
-
     def _resolve_import(self, source_dir: Path, import_path: str) -> Optional[Path]:
         """Resolve a relative import path to an actual file.
 
@@ -326,7 +317,7 @@ def cmd_validate(args):
     elif args.check == 'dom':
         result = validator.validate_dom_references()
     elif args.check == 'imports':
-        result = validator.validate_imports()
+        result = validator.validate_unresolved_imports()
     else:
         print(f"Unknown check type: {args.check}")
         store.close()

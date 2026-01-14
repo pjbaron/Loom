@@ -167,6 +167,16 @@ class IngestionMixin:
                             stats["methods"] += 1
 
                     # Store relationships (handle both 3-tuple and 4-tuple formats)
+                    # Relations that should be stored as cross-file refs when unresolved
+                    CROSS_FILE_REF_TYPES = {
+                        'dom_reference',  # JS getElementById -> HTML element
+                        'imports',        # import statements -> modules/files
+                        'calls',          # function/method calls -> functions
+                        'instantiates',   # class instantiation -> classes
+                    }
+                    # Relations that are always local (don't store as cross-file refs)
+                    LOCAL_ONLY_TYPES = {'contains', 'member_of', 'exports'}
+
                     for rel in parse_result.relationships:
                         if len(rel) == 4:
                             from_name, to_name, relation, rel_metadata = rel
@@ -177,10 +187,11 @@ class IngestionMixin:
                         to_id = name_to_id.get(to_name)
 
                         if from_id and to_id:
+                            # Both entities exist - store normal relationship
                             self.add_relationship(from_id, to_id, relation, rel_metadata)
-                        elif from_id and relation == 'dom_reference':
-                            # DOM references may point to elements in other files
-                            # Store as a special relationship with target as name
+                        elif from_id and not to_id and relation not in LOCAL_ONLY_TYPES:
+                            # Source exists but target doesn't - store as cross-file ref
+                            # This allows validation to check if target exists elsewhere
                             self._store_cross_file_reference(
                                 from_id, to_name, relation, rel_metadata, str(source_file)
                             )
@@ -202,16 +213,35 @@ class IngestionMixin:
         metadata: dict,
         source_file: str
     ):
-        """Store a cross-file reference (e.g., JS DOM reference to HTML element).
+        """Store a cross-file reference for later validation.
 
-        These are references where the target may be in a different file
-        and needs to be validated after all files are ingested.
+        These are references where the target entity wasn't found during parsing
+        and may exist in a different file. Stored for cross-language validation.
+
+        Supported ref_types:
+        - 'dom_reference': JS getElementById/querySelector -> HTML element IDs
+        - 'imports': import/include statements -> modules/files
+        - 'calls': function/method calls -> functions that weren't found locally
+        - 'instantiates': class instantiation -> classes
+
+        Args:
+            source_entity_id: The entity making the reference
+            target_name: The name being referenced (may not exist as entity)
+            ref_type: Type of reference (dom_reference, imports, calls, etc.)
+            metadata: Parser-provided metadata (line, verifiable, reason, etc.)
+            source_file: Path to the source file containing the reference
         """
         import json
 
-        line_number = metadata.get('line', 0) if metadata else 0
-        verifiable = metadata.get('verifiable', True) if metadata else True
-        reason = metadata.get('reason', None) if metadata else None
+        # Extract common metadata fields with sensible defaults
+        line_number = 0
+        verifiable = True
+        reason = None
+
+        if metadata:
+            line_number = metadata.get('line', metadata.get('line_number', 0))
+            verifiable = metadata.get('verifiable', True)
+            reason = metadata.get('reason', metadata.get('verification_reason', None))
 
         self.conn.execute("""
             INSERT INTO cross_file_refs
