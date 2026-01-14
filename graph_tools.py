@@ -85,6 +85,9 @@ def orphan_entities() -> str:
     Identifies entities that have no relationships with other entities,
     which may indicate unused or dead code that could be removed.
 
+    Also finds methods/functions that are defined but never called,
+    which may indicate incomplete wiring or dead code.
+
     Returns:
         Formatted list of orphan entities grouped by kind
     """
@@ -94,33 +97,94 @@ def orphan_entities() -> str:
         return "Error: No Loom database found. Run './loom ingest <path>' first."
     try:
         orphans = store.get_orphans()
-        if not orphans:
-            return "No orphan entities found. All code is connected."
+        uncalled = store.get_uncalled_methods(exclude_private=True)
 
-        # Group by kind
-        by_kind: dict = {}
-        for orphan in orphans:
-            kind = orphan.get('kind', 'unknown')
-            if kind not in by_kind:
-                by_kind[kind] = []
-            by_kind[kind].append(orphan)
+        lines = []
 
-        lines = [f"Found {len(orphans)} Orphan Entities (No Relationships):", ""]
-        lines.append("These entities may be dead code or entry points.")
-        lines.append("")
+        # Section 1: Uncalled methods (most actionable)
+        if uncalled:
+            # First, highlight likely setup/wiring methods that are uncalled
+            # These are high-priority as they often indicate incomplete initialization
+            setup_patterns = ('set', 'init', 'configure', 'register', 'connect', 'wire', 'bind', 'attach')
+            setup_methods = [
+                m for m in uncalled
+                if any(m['name'].split('.')[-1].lower().startswith(p) for p in setup_patterns)
+                and m['name'].split('.')[-1] != 'constructor'
+            ]
 
-        for kind in sorted(by_kind.keys()):
-            entities = by_kind[kind]
-            lines.append(f"{kind.capitalize()}s ({len(entities)}):")
-            for entity in entities[:20]:  # Limit per kind
-                metadata = entity.get('metadata') or {}
-                file_path = metadata.get('file_path', '')
-                lineno = metadata.get('lineno', '')
-                location = f" ({file_path}:{lineno})" if file_path else ""
-                lines.append(f"  - {entity['name']}{location}")
-            if len(entities) > 20:
-                lines.append(f"  ... and {len(entities) - 20} more")
+            if setup_methods:
+                lines.append("🚨 LIKELY WIRING ISSUES - Uncalled Setup Methods:")
+                lines.append("")
+                lines.append("These set*/init*/configure* methods are never called - probable bugs!")
+                lines.append("")
+                for method in setup_methods[:20]:
+                    short_name = method['name'].split('.')[-1]
+                    parent = '.'.join(method['name'].split('.')[:-1])
+                    metadata = method.get('metadata') or {}
+                    lineno = metadata.get('lineno', metadata.get('start_line', ''))
+                    lines.append(f"  ⚠️  {parent}.{short_name}() [line {lineno}]")
+                if len(setup_methods) > 20:
+                    lines.append(f"  ... and {len(setup_methods) - 20} more")
+                lines.append("")
+
+            lines.append(f"Found {len(uncalled)} Uncalled Methods/Functions total:")
             lines.append("")
+            lines.append("(May include constructors, getters, and future-use methods)")
+            lines.append("")
+
+            # Group by module/class
+            by_parent: dict = {}
+            for method in uncalled:
+                name_parts = method['name'].rsplit('.', 1)
+                parent = name_parts[0] if len(name_parts) > 1 else '(module-level)'
+                if parent not in by_parent:
+                    by_parent[parent] = []
+                by_parent[parent].append(method)
+
+            for parent in sorted(by_parent.keys())[:15]:  # Limit parents shown
+                methods = by_parent[parent]
+                lines.append(f"  {parent}:")
+                for method in methods[:10]:  # Limit methods per parent
+                    short_name = method['name'].split('.')[-1]
+                    metadata = method.get('metadata') or {}
+                    lineno = metadata.get('lineno', metadata.get('start_line', ''))
+                    lines.append(f"    - {short_name}() [line {lineno}]")
+                if len(methods) > 10:
+                    lines.append(f"    ... and {len(methods) - 10} more")
+            if len(by_parent) > 15:
+                lines.append(f"  ... and {len(by_parent) - 15} more classes/modules")
+            lines.append("")
+
+        # Section 2: True orphans (no relationships at all)
+        if orphans:
+            lines.append(f"Found {len(orphans)} Orphan Entities (No Relationships):")
+            lines.append("")
+            lines.append("These entities may be dead code or entry points.")
+            lines.append("")
+
+            # Group by kind
+            by_kind: dict = {}
+            for orphan in orphans:
+                kind = orphan.get('kind', 'unknown')
+                if kind not in by_kind:
+                    by_kind[kind] = []
+                by_kind[kind].append(orphan)
+
+            for kind in sorted(by_kind.keys()):
+                entities = by_kind[kind]
+                lines.append(f"{kind.capitalize()}s ({len(entities)}):")
+                for entity in entities[:20]:  # Limit per kind
+                    metadata = entity.get('metadata') or {}
+                    file_path = metadata.get('file_path', '')
+                    lineno = metadata.get('lineno', '')
+                    location = f" ({file_path}:{lineno})" if file_path else ""
+                    lines.append(f"  - {entity['name']}{location}")
+                if len(entities) > 20:
+                    lines.append(f"  ... and {len(entities) - 20} more")
+                lines.append("")
+
+        if not orphans and not uncalled:
+            return "No orphan entities or uncalled methods found. All code is connected and used."
 
         return "\n".join(lines)
     finally:

@@ -1138,6 +1138,76 @@ class CodeStore(SchemaMixin, ChangeTrackingMixin, TraceMixin, NoteMixin, Ingesti
 
         return [self._row_to_dict(row) for row in rows]
 
+    def get_uncalled_methods(self, exclude_private: bool = True) -> List[Dict]:
+        """
+        Find methods and functions that are never called.
+
+        These are entities of kind 'method' or 'function' that exist
+        (may have member_of or contains relationships) but are never
+        the target of a 'calls' relationship.
+
+        This catches cases like setTileImages() being defined but never
+        wired up - more specific than get_orphans() which requires
+        zero relationships.
+
+        Args:
+            exclude_private: If True, exclude methods starting with '_'
+                           (considered internal/private by convention)
+
+        Returns:
+            List of entity dicts for uncalled methods/functions
+        """
+        # First, get all method/function entities
+        rows = self.conn.execute("""
+            SELECT e.* FROM entities e
+            WHERE e.kind IN ('method', 'function')
+        """).fetchall()
+
+        all_methods = [self._row_to_dict(row) for row in rows]
+
+        # Get all called method IDs (from relationships)
+        called_ids = set()
+        cursor = self.conn.execute("""
+            SELECT DISTINCT target_id FROM relationships
+            WHERE relation = 'calls'
+        """)
+        for row in cursor:
+            called_ids.add(row[0])
+
+        # Get all method names that are called (from cross_file_refs)
+        called_names = set()
+        cursor = self.conn.execute("""
+            SELECT DISTINCT target_name FROM cross_file_refs
+            WHERE ref_type = 'calls'
+        """)
+        for row in cursor:
+            called_names.add(row[0])
+
+        # Filter to uncalled methods
+        uncalled = []
+        for method in all_methods:
+            # Skip if called by ID
+            if method['id'] in called_ids:
+                continue
+
+            # Get short name (last part after dot)
+            short_name = method['name'].split('.')[-1]
+
+            # Skip if called by name
+            if short_name in called_names:
+                continue
+
+            uncalled.append(method)
+
+        if exclude_private:
+            # Filter out private methods (starting with _)
+            uncalled = [
+                m for m in uncalled
+                if not m['name'].split('.')[-1].startswith('_')
+            ]
+
+        return uncalled
+
     def get_path(
         self, from_name: str, to_name: str, max_depth: int = 5
     ) -> List[List[str]]:
