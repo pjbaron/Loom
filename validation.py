@@ -522,6 +522,7 @@ class CodeValidator:
         total_files = 0
         valid_files = 0
         syntax_errors = 0
+        esprima_limitations = 0
         duplicate_warnings = 0
         dangerous_patterns = 0
 
@@ -600,7 +601,6 @@ class CodeValidator:
                         details={'marker': marker}
                     ))
             else:
-                syntax_errors += 1
                 error_msg = validation.get('syntax_error', 'Unknown syntax error')
                 error_line = validation.get('error_line', 0)
                 error_col = validation.get('error_column', 0)
@@ -608,6 +608,9 @@ class CodeValidator:
                 # Build context snippet
                 context = validation.get('error_context_snippet', {})
                 snippet_lines = context.get('lines', []) if context else []
+
+                # Check if this is an ES2020+ syntax issue (esprima limitation)
+                es2020_pattern = self._detect_es2020_syntax(js_code, error_line, error_col)
 
                 # Get enclosing function info if available
                 enclosing = validation.get('enclosing_function', {})
@@ -625,19 +628,37 @@ class CodeValidator:
                     details['function_start'] = enclosing.get('start_line')
                     details['function_end'] = enclosing.get('end_line')
 
-                result.errors.append(ValidationIssue(
-                    level='error',
-                    category='syntax',
-                    message=error_msg,
-                    file=file_path,
-                    line=error_line,
-                    details=details
-                ))
+                if es2020_pattern:
+                    # This is likely an esprima limitation, not a real error
+                    esprima_limitations += 1
+                    details['es2020_feature'] = es2020_pattern
+                    details['esprima_limitation'] = True
+                    result.warnings.append(ValidationIssue(
+                        level='warning',
+                        category='syntax',
+                        message=f"Esprima limitation: '{es2020_pattern}' is ES2020+ syntax not supported by esprima 4.x. "
+                                f"Code is likely valid - verify manually or use a newer parser.",
+                        file=file_path,
+                        line=error_line,
+                        details=details
+                    ))
+                else:
+                    # Genuine syntax error
+                    syntax_errors += 1
+                    result.errors.append(ValidationIssue(
+                        level='error',
+                        category='syntax',
+                        message=error_msg,
+                        file=file_path,
+                        line=error_line,
+                        details=details
+                    ))
 
         result.stats = {
             'total_files': total_files,
             'valid_files': valid_files,
             'syntax_errors': syntax_errors,
+            'esprima_limitations': esprima_limitations,
             'duplicate_warnings': duplicate_warnings,
             'dangerous_patterns': dangerous_patterns
         }
@@ -950,6 +971,57 @@ class CodeValidator:
         except Exception:
             pass
 
+        return None
+
+    def _detect_es2020_syntax(self, js_code: str, error_line: int, error_col: int) -> Optional[str]:
+        """Detect if the error location contains ES2020+ syntax that esprima doesn't support.
+
+        Returns the detected pattern name if found, None otherwise.
+
+        ES2020+ features not supported by esprima 4.x:
+        - Optional chaining: obj?.prop, obj?.[key], obj?.method()
+        - Nullish coalescing: value ?? default
+        - Nullish assignment: value ??= default
+        - Logical assignment: value ||= default, value &&= default
+        - Private class fields: #privateField
+        - BigInt: 123n
+        """
+        lines = js_code.splitlines()
+        if error_line < 1 or error_line > len(lines):
+            return None
+
+        # Get the line and a window around the error column
+        line = lines[error_line - 1]
+
+        # Check for patterns near the error column
+        # Use a window of ±5 characters around error position
+        start = max(0, error_col - 5)
+        end = min(len(line), error_col + 10)
+        window = line[start:end]
+
+        # Also check the whole line for patterns
+        patterns = [
+            (r'\?\.',  'optional chaining (?.)'),
+            (r'\?\?\s*=', 'nullish assignment (??=)'),
+            (r'\?\?',  'nullish coalescing (??)'),
+            (r'\|\|\s*=', 'logical OR assignment (||=)'),
+            (r'&&\s*=', 'logical AND assignment (&&=)'),
+            (r'#\w+',  'private class field (#field)'),
+            (r'\d+n\b', 'BigInt literal (123n)'),
+        ]
+
+        # First check the window around error
+        for pattern, name in patterns:
+            if re.search(pattern, window):
+                return name
+
+        # Then check the whole line
+        for pattern, name in patterns:
+            if re.search(pattern, line):
+                return name
+
+        # Check if error message hints at these patterns
+        # (e.g., "Unexpected token ." after "?")
         return None
 
     def _resolve_import(self, source_dir: Path, import_path: str) -> Optional[Path]:
