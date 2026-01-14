@@ -1223,6 +1223,9 @@ Checks for:
   - DOM references: JS getElementById/querySelector calls that reference
     non-existent HTML element IDs
   - Imports: Relative import statements that point to missing files
+  - Methods: getFoo()/setFoo() calls when only foo property exists
+  - Syntax: JS syntax errors via esprima AST parsing (requires: pip install esprima)
+    Also detects duplicates, dangerous patterns (eval/with/debugger)
 
 Reports:
   - ERRORS: Verifiable issues that must be fixed
@@ -1231,12 +1234,13 @@ Reports:
 Examples:
   ./loom validate                    # Run all validations
   ./loom validate --check dom        # Only check DOM references
+  ./loom validate --check syntax     # Only check JS syntax
   ./loom validate --level warn       # Show warnings too
   ./loom validate --json             # Output as JSON (for CI)
 """,
         formatter_class=argparse.RawDescriptionHelpFormatter)
-    p_validate.add_argument("--check", choices=["all", "dom", "imports", "methods"], default="all",
-                            help="What to validate (default: all)")
+    p_validate.add_argument("--check", choices=["all", "dom", "imports", "methods", "syntax"], default="all",
+                            help="What to validate: all, dom, imports, methods, syntax (default: all)")
     p_validate.add_argument("--level", choices=["error", "warn", "all"], default="error",
                             help="Minimum issue level to show (default: error)")
     p_validate.add_argument("--json", action="store_true", help="Output as JSON")

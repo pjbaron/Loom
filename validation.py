@@ -4,6 +4,7 @@ Code validation module for cross-language reference checking.
 Validates:
 - DOM references: JS getElementById/querySelector calls vs HTML element IDs
 - Import resolution: JS/TS imports vs actual file existence
+- JS Syntax: Real AST parsing via esprima for syntax errors
 - Function arity: Function calls vs function definitions (future)
 
 Reports:
@@ -12,9 +13,18 @@ Reports:
 """
 
 import json
+import re
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple, Any
 from dataclasses import dataclass, field
+
+# Optional esprima for JS syntax validation
+try:
+    import esprima
+    HAS_ESPRIMA = True
+except ImportError:
+    esprima = None
+    HAS_ESPRIMA = False
 
 
 @dataclass
@@ -76,20 +86,24 @@ class CodeValidator:
         dom_result = self.validate_dom_references()
         import_result = self.validate_unresolved_imports()
         method_result = self.validate_method_calls()
+        syntax_result = self.validate_js_syntax()
 
         # Combine results
         result.errors.extend(dom_result.errors)
         result.errors.extend(import_result.errors)
         result.errors.extend(method_result.errors)
+        result.errors.extend(syntax_result.errors)
         result.warnings.extend(dom_result.warnings)
         result.warnings.extend(import_result.warnings)
         result.warnings.extend(method_result.warnings)
+        result.warnings.extend(syntax_result.warnings)
 
         # Combine stats
         result.stats = {
             'dom': dom_result.stats,
             'imports': import_result.stats,
             'methods': method_result.stats,
+            'syntax': syntax_result.stats,
             'total_errors': len(result.errors),
             'total_warnings': len(result.warnings)
         }
@@ -468,6 +482,476 @@ class CodeValidator:
 
         return result
 
+    def validate_js_syntax(self) -> ValidationResult:
+        """Validate JavaScript files using esprima AST parsing.
+
+        Detects:
+        - Syntax errors with precise line/column information
+        - Duplicate top-level identifiers
+        - Dangerous patterns (eval, with, debugger, Function constructor)
+        - Leftover template markers
+
+        Requires esprima: pip install esprima
+        """
+        result = ValidationResult()
+
+        if not HAS_ESPRIMA:
+            result.warnings.append(ValidationIssue(
+                level='warning',
+                category='syntax',
+                message="esprima not installed - run 'pip install esprima' for JS syntax validation",
+                file='',
+                line=0,
+                details={}
+            ))
+            result.stats = {'skipped': True, 'reason': 'esprima not installed'}
+            return result
+
+        # Get all JavaScript files from entities (file_path is in metadata JSON)
+        cursor = self.store.conn.execute("""
+            SELECT DISTINCT json_extract(metadata, '$.file_path') as file_path
+            FROM entities
+            WHERE metadata IS NOT NULL
+              AND (json_extract(metadata, '$.file_path') LIKE '%.js'
+                   OR json_extract(metadata, '$.file_path') LIKE '%.mjs'
+                   OR json_extract(metadata, '$.file_path') LIKE '%.cjs')
+        """)
+
+        js_files = [row['file_path'] for row in cursor.fetchall() if row['file_path']]
+
+        total_files = 0
+        valid_files = 0
+        syntax_errors = 0
+        duplicate_warnings = 0
+        dangerous_patterns = 0
+
+        for file_path in js_files:
+            total_files += 1
+            path = Path(file_path)
+
+            if not path.exists():
+                continue
+
+            try:
+                js_code = path.read_text(encoding='utf-8', errors='replace')
+            except Exception as e:
+                result.warnings.append(ValidationIssue(
+                    level='warning',
+                    category='syntax',
+                    message=f"Could not read file: {e}",
+                    file=file_path,
+                    line=0,
+                    details={}
+                ))
+                continue
+
+            # Validate this file
+            validation = self._validate_js_file(js_code, file_path)
+
+            if validation['is_valid']:
+                valid_files += 1
+
+                # Check for duplicates
+                top_ids = validation.get('top_level_identifiers', {})
+                duplicates = top_ids.get('duplicates', [])
+                for dup in duplicates:
+                    duplicate_warnings += 1
+                    result.warnings.append(ValidationIssue(
+                        level='warning',
+                        category='syntax',
+                        message=f"Duplicate identifier '{dup}' at top level",
+                        file=file_path,
+                        line=0,
+                        details={
+                            'identifier': dup,
+                            'type': 'duplicate'
+                        }
+                    ))
+
+                # Check for dangerous patterns
+                dangers = validation.get('dangerous_patterns', [])
+                for danger in dangers:
+                    dangerous_patterns += 1
+                    pattern = danger.get('pattern', 'unknown')
+                    loc = danger.get('loc', {})
+                    line = loc.get('line', 0) if loc else 0
+
+                    result.warnings.append(ValidationIssue(
+                        level='warning',
+                        category='syntax',
+                        message=f"Dangerous pattern: {pattern}",
+                        file=file_path,
+                        line=line,
+                        details={
+                            'pattern': pattern,
+                            'location': loc
+                        }
+                    ))
+
+                # Check for leftover markers
+                markers = validation.get('leftover_markers', [])
+                for marker in markers:
+                    result.warnings.append(ValidationIssue(
+                        level='warning',
+                        category='syntax',
+                        message=f"Leftover template marker: {marker}",
+                        file=file_path,
+                        line=0,
+                        details={'marker': marker}
+                    ))
+            else:
+                syntax_errors += 1
+                error_msg = validation.get('syntax_error', 'Unknown syntax error')
+                error_line = validation.get('error_line', 0)
+                error_col = validation.get('error_column', 0)
+
+                # Build context snippet
+                context = validation.get('error_context_snippet', {})
+                snippet_lines = context.get('lines', []) if context else []
+
+                # Get enclosing function info if available
+                enclosing = validation.get('enclosing_function', {})
+
+                details = {
+                    'error_column': error_col,
+                    'module_type': validation.get('module_type', 'script')
+                }
+
+                if snippet_lines:
+                    details['context'] = '\n'.join(snippet_lines[:7])
+
+                if enclosing and enclosing.get('name'):
+                    details['enclosing_function'] = enclosing.get('name')
+                    details['function_start'] = enclosing.get('start_line')
+                    details['function_end'] = enclosing.get('end_line')
+
+                result.errors.append(ValidationIssue(
+                    level='error',
+                    category='syntax',
+                    message=error_msg,
+                    file=file_path,
+                    line=error_line,
+                    details=details
+                ))
+
+        result.stats = {
+            'total_files': total_files,
+            'valid_files': valid_files,
+            'syntax_errors': syntax_errors,
+            'duplicate_warnings': duplicate_warnings,
+            'dangerous_patterns': dangerous_patterns
+        }
+
+        return result
+
+    def _validate_js_file(self, js_code: str, file_path: str) -> Dict[str, Any]:
+        """Validate a single JavaScript file using esprima.
+
+        Returns a dict with:
+        - is_valid: bool
+        - syntax_error: error message if invalid
+        - error_line, error_column: location if invalid
+        - error_context_snippet: nearby code lines
+        - enclosing_function: function containing the error
+        - top_level_identifiers: {functions, variables, duplicates}
+        - dangerous_patterns: list of {pattern, loc}
+        - leftover_markers: list of marker types found
+        """
+        report: Dict[str, Any] = {
+            'module_type': None,
+            'is_valid': False,
+            'syntax_error': None,
+            'node_counts_by_type': {},
+            'top_level_identifiers': {
+                'functions': [],
+                'variables': [],
+                'duplicates': [],
+            },
+            'dangerous_patterns': [],
+            'leftover_markers': [],
+        }
+
+        # Decide module vs script parsing based on import statements
+        is_module = (re.search(r'^\s*import\s', js_code, flags=re.MULTILINE) is not None or
+                     re.search(r'^\s*export\s', js_code, flags=re.MULTILINE) is not None)
+        parse_fn = esprima.parseModule if is_module else esprima.parseScript
+        report['module_type'] = 'module' if is_module else 'script'
+
+        try:
+            program = parse_fn(js_code, tolerant=False, loc=True, range=True)
+            report['is_valid'] = True
+        except Exception as exc:
+            msg = str(exc)
+            report['syntax_error'] = msg
+            loc = self._extract_error_location(exc)
+            report['syntax_error_detail'] = loc
+
+            lines = js_code.splitlines()
+            err_line = int(loc.get('line') or 0)
+            err_col = int(loc.get('column') or 0)
+
+            if err_line > 0:
+                report['error_line'] = err_line
+                report['error_column'] = err_col
+                report['error_context_snippet'] = self._build_context_snippet(lines, err_line)
+
+                # Try to extract enclosing function
+                func_info = self._extract_function_at_error(js_code, err_line, err_col)
+                if func_info:
+                    report['enclosing_function'] = func_info
+
+            report['is_valid'] = False
+            return report
+
+        # Analyze valid code
+        self._analyze_valid_js(program, js_code, report)
+        return report
+
+    def _extract_error_location(self, exc: Exception) -> Dict[str, Optional[int]]:
+        """Extract line/column from esprima exception."""
+        line_num: Optional[int] = None
+        col_num: Optional[int] = None
+
+        try:
+            line_num = getattr(exc, 'lineNumber', None) or getattr(exc, 'line', None)
+            col_num = getattr(exc, 'column', None)
+        except Exception:
+            pass
+
+        if line_num is None or col_num is None:
+            text = str(exc)
+            m = re.search(r'Line\s+(?P<line>\d+)(?::(?P<col>\d+))?', text)
+            if m:
+                try:
+                    line_num = int(m.group('line'))
+                    col_str = m.group('col')
+                    col_num = int(col_str) if col_str else col_num
+                except Exception:
+                    pass
+
+            if line_num is None or col_num is None:
+                m2 = re.search(r'\((?P<line>\d+):(?P<col>\d+)\)', text)
+                if m2:
+                    try:
+                        line_num = int(m2.group('line'))
+                        col_num = int(m2.group('col'))
+                    except Exception:
+                        pass
+
+        return {'line': line_num, 'column': col_num}
+
+    def _build_context_snippet(self, lines: List[str], error_line: int, radius: int = 6) -> Dict[str, Any]:
+        """Build error context snippet around error line."""
+        start = max(1, error_line - radius)
+        end = min(len(lines), error_line + radius)
+        snippet = lines[start - 1:end]
+        return {'start_line': start, 'end_line': end, 'lines': snippet}
+
+    def _traverse_ast(self, node) -> List[Any]:
+        """Depth-first AST traversal."""
+        stack = [node]
+        seen: set = set()
+        out: List[Any] = []
+
+        while stack:
+            cur = stack.pop()
+            try:
+                node_id = id(cur)
+            except Exception:
+                continue
+
+            if node_id in seen:
+                continue
+            seen.add(node_id)
+
+            if getattr(cur, 'type', None) is None:
+                continue
+
+            out.append(cur)
+
+            for attr_name in dir(cur):
+                if attr_name.startswith('_') or attr_name in ('type', 'range', 'loc'):
+                    continue
+                try:
+                    value = getattr(cur, attr_name)
+                except Exception:
+                    continue
+
+                if getattr(value, 'type', None) is not None:
+                    stack.append(value)
+                elif isinstance(value, (list, tuple)):
+                    for item in value:
+                        if getattr(item, 'type', None) is not None:
+                            stack.append(item)
+
+        return out
+
+    def _extract_function_at_error(self, js_code: str, error_line: int, error_column: int = 0) -> Optional[Dict[str, Any]]:
+        """Extract the innermost function containing the error location."""
+        is_module = (re.search(r'^\s*import\s', js_code, flags=re.MULTILINE) is not None or
+                     re.search(r'^\s*export\s', js_code, flags=re.MULTILINE) is not None)
+        parse_fn = esprima.parseModule if is_module else esprima.parseScript
+
+        try:
+            program = parse_fn(js_code, tolerant=True, loc=True, range=True)
+        except Exception:
+            return None
+
+        def _within_bounds(s_line: int, s_col: int, e_line: int, e_col: int) -> bool:
+            if error_line < s_line or error_line > e_line:
+                return False
+            if error_line == s_line and error_column < s_col:
+                return False
+            if error_line == e_line and error_column > e_col:
+                return False
+            return True
+
+        best_function = None
+        smallest_span = None
+
+        for node in self._traverse_ast(program):
+            node_type = getattr(node, 'type', '')
+            if node_type not in ('FunctionDeclaration', 'FunctionExpression', 'ArrowFunctionExpression'):
+                continue
+
+            loc = getattr(node, 'loc', None)
+            if not loc:
+                continue
+
+            start = getattr(loc, 'start', None)
+            end = getattr(loc, 'end', None)
+            if not start or not end:
+                continue
+
+            s_line = int(getattr(start, 'line', 0) or 0)
+            s_col = int(getattr(start, 'column', 0) or 0)
+            e_line = int(getattr(end, 'line', 0) or 0)
+            e_col = int(getattr(end, 'column', 0) or 0)
+
+            if not _within_bounds(s_line, s_col, e_line, e_col):
+                continue
+
+            rng = getattr(node, 'range', None)
+            span = None
+            if isinstance(rng, (list, tuple)) and len(rng) == 2:
+                try:
+                    span = int(rng[1]) - int(rng[0])
+                except Exception:
+                    pass
+
+            if best_function is None or (span is not None and (smallest_span is None or span < smallest_span)):
+                best_function = node
+                smallest_span = span
+
+        if best_function is None:
+            return None
+
+        # Extract function details
+        loc = getattr(best_function, 'loc', None)
+        start = getattr(loc, 'start', None)
+        end = getattr(loc, 'end', None)
+
+        name = None
+        func_id = getattr(best_function, 'id', None)
+        if getattr(func_id, 'name', None) is not None:
+            name = func_id.name
+
+        return {
+            'name': name,
+            'start_line': int(getattr(start, 'line', 0) or 0),
+            'end_line': int(getattr(end, 'line', 0) or 0),
+            'type': getattr(best_function, 'type', 'function')
+        }
+
+    def _analyze_valid_js(self, program, js_code: str, report: Dict[str, Any]) -> None:
+        """Analyze valid JavaScript code for patterns and statistics."""
+        top_functions: List[str] = []
+        top_variables: List[str] = []
+
+        for node in getattr(program, 'body', []) or []:
+            if node.type == 'FunctionDeclaration' and getattr(node, 'id', None) is not None:
+                top_functions.append(node.id.name)
+            elif node.type == 'VariableDeclaration':
+                for decl in getattr(node, 'declarations', []) or []:
+                    if getattr(getattr(decl, 'id', None), 'type', None) == 'Identifier':
+                        top_variables.append(decl.id.name)
+
+        # Check for duplicates
+        seen: set = set()
+        dups: List[str] = []
+        for name in top_functions + top_variables:
+            if name in seen:
+                dups.append(name)
+            else:
+                seen.add(name)
+
+        report['top_level_identifiers'] = {
+            'functions': top_functions,
+            'variables': top_variables,
+            'duplicates': sorted(set(dups)),
+        }
+
+        # Node type counts and dangerous patterns
+        node_counts: Dict[str, int] = {}
+        dangers: List[Dict[str, Any]] = []
+
+        for node in self._traverse_ast(program):
+            node_type = getattr(node, 'type', '')
+            if not node_type:
+                continue
+
+            node_counts[node_type] = node_counts.get(node_type, 0) + 1
+
+            # Check for dangerous patterns
+            if node_type == 'WithStatement':
+                dangers.append({'pattern': 'with_statement', 'loc': self._get_node_location(node)})
+            elif node_type == 'DebuggerStatement':
+                dangers.append({'pattern': 'debugger_statement', 'loc': self._get_node_location(node)})
+            elif node_type == 'CallExpression':
+                callee = getattr(node, 'callee', None)
+                if getattr(callee, 'type', None) == 'Identifier' and getattr(callee, 'name', None) == 'eval':
+                    dangers.append({'pattern': 'eval_call', 'loc': self._get_node_location(node)})
+                if getattr(callee, 'type', None) == 'Identifier' and getattr(callee, 'name', None) == 'Function':
+                    dangers.append({'pattern': 'function_constructor', 'loc': self._get_node_location(node)})
+            elif node_type == 'NewExpression':
+                callee = getattr(node, 'callee', None)
+                if getattr(callee, 'type', None) == 'Identifier' and getattr(callee, 'name', None) == 'Function':
+                    dangers.append({'pattern': 'function_constructor', 'loc': self._get_node_location(node)})
+
+        report['node_counts_by_type'] = dict(sorted(node_counts.items()))
+        report['dangerous_patterns'] = dangers
+
+        # Check for leftover template markers
+        leftover = []
+        if re.search(r'<slot:\w+>', js_code):
+            leftover.append('slot_start_marker')
+        if re.search(r'</slot:\w+>', js_code):
+            leftover.append('slot_end_marker')
+        if re.search(r'<section:\w+>', js_code):
+            leftover.append('section_start_marker')
+        if re.search(r'</section:\w+>', js_code):
+            leftover.append('section_end_marker')
+
+        report['leftover_markers'] = sorted(set(leftover))
+
+    def _get_node_location(self, node) -> Optional[Dict[str, int]]:
+        """Extract location information from AST node."""
+        loc = getattr(node, 'loc', None)
+        if not loc:
+            return None
+
+        try:
+            start = getattr(loc, 'start', None)
+            if start is not None:
+                return {
+                    'line': int(getattr(start, 'line', None) or 0),
+                    'column': int(getattr(start, 'column', None) or 0),
+                }
+        except Exception:
+            pass
+
+        return None
+
     def _resolve_import(self, source_dir: Path, import_path: str) -> Optional[Path]:
         """Resolve a relative import path to an actual file.
 
@@ -519,6 +1003,8 @@ def cmd_validate(args):
         result = validator.validate_unresolved_imports()
     elif args.check == 'methods':
         result = validator.validate_method_calls()
+    elif args.check == 'syntax':
+        result = validator.validate_js_syntax()
     else:
         print(f"Unknown check type: {args.check}")
         store.close()
