@@ -14,6 +14,7 @@ Loom builds a semantic graph of your codebase, enabling intelligent code navigat
 - **TODO Tracking** - Persistent work queue with detailed task prompts
 - **Test Intelligence** - Smart test selection based on code changes
 - **Multi-Language Support** - Python, JavaScript, TypeScript, C++ (extensible via tree-sitter)
+- **AST is saved to a local db** - Reduce token cost for Claude Code with efficient queries
 
 ## Installation
 
