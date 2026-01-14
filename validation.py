@@ -75,17 +75,21 @@ class CodeValidator:
         # Run validations for each cross-file ref type
         dom_result = self.validate_dom_references()
         import_result = self.validate_unresolved_imports()
+        method_result = self.validate_method_calls()
 
         # Combine results
         result.errors.extend(dom_result.errors)
         result.errors.extend(import_result.errors)
+        result.errors.extend(method_result.errors)
         result.warnings.extend(dom_result.warnings)
         result.warnings.extend(import_result.warnings)
+        result.warnings.extend(method_result.warnings)
 
         # Combine stats
         result.stats = {
             'dom': dom_result.stats,
             'imports': import_result.stats,
+            'methods': method_result.stats,
             'total_errors': len(result.errors),
             'total_warnings': len(result.warnings)
         }
@@ -269,6 +273,201 @@ class CodeValidator:
 
         return result
 
+    def validate_method_calls(self) -> ValidationResult:
+        """Validate method calls against known class definitions.
+
+        Detects issues like:
+        - Calling obj.getFoo() when class only has obj.foo (getter pattern mismatch)
+        - Calling methods that don't exist on any known class
+
+        Uses heuristics since JavaScript is dynamically typed:
+        - Matches method calls against all class methods in the codebase
+        - Special detection for getFoo/setFoo patterns vs foo properties
+        """
+        import re
+
+        result = ValidationResult()
+
+        # Build lookup of all class methods and properties
+        # Maps method_name -> list of (class_name, is_getter)
+        class_methods: Dict[str, List[Tuple[str, bool]]] = {}
+        class_properties: Dict[str, List[str]] = {}  # property_name -> [class_names]
+
+        # Get all class entities with their methods
+        cursor = self.store.conn.execute("""
+            SELECT name, metadata FROM entities
+            WHERE kind = 'class'
+        """)
+
+        for row in cursor.fetchall():
+            class_name = row['name']
+            metadata = json.loads(row['metadata']) if row['metadata'] else {}
+            methods = metadata.get('methods', [])
+
+            for method in methods:
+                if method not in class_methods:
+                    class_methods[method] = []
+                # Check if it's a getter (starts with 'get' followed by uppercase)
+                is_getter = method.startswith('get') and len(method) > 3 and method[3].isupper()
+                class_methods[method].append((class_name, is_getter))
+
+        # Get all method entities to find getters/setters
+        cursor = self.store.conn.execute("""
+            SELECT e.name, e.metadata, r.target_id
+            FROM entities e
+            JOIN relationships r ON e.id = r.source_id
+            WHERE e.kind = 'method' AND r.relation = 'member_of'
+        """)
+
+        for row in cursor.fetchall():
+            method_name = row['name'].split('.')[-1]  # Get just the method name
+            class_id = row['target_id']
+
+            # Get class name
+            class_row = self.store.conn.execute(
+                "SELECT name FROM entities WHERE id = ?", (class_id,)
+            ).fetchone()
+            if not class_row:
+                continue
+            class_name = class_row['name']
+
+            # Track in class_methods if not already there
+            if method_name not in class_methods:
+                class_methods[method_name] = []
+            if (class_name, False) not in class_methods[method_name]:
+                class_methods[method_name].append((class_name, False))
+
+            # Check if this looks like a property accessor (getter/setter in JS)
+            # JS getters are defined as `get propName()` in class body
+            metadata = json.loads(row['metadata']) if row['metadata'] else {}
+            code = metadata.get('code', '')
+
+            # Detect JS getter syntax: get foo() { ... }
+            if re.match(r'^\s*get\s+', code):
+                prop_name = method_name
+                if prop_name not in class_properties:
+                    class_properties[prop_name] = []
+                if class_name not in class_properties[prop_name]:
+                    class_properties[prop_name].append(class_name)
+
+        # Also check entity code for getter patterns in classes
+        cursor = self.store.conn.execute("""
+            SELECT name, code FROM entities
+            WHERE kind = 'class' AND code IS NOT NULL
+        """)
+
+        for row in cursor.fetchall():
+            class_name = row['name']
+            code = row['code'] or ''
+
+            # Find getter definitions: get propertyName() { ... }
+            getter_pattern = r'\bget\s+(\w+)\s*\(\s*\)'
+            for match in re.finditer(getter_pattern, code):
+                prop_name = match.group(1)
+                if prop_name not in class_properties:
+                    class_properties[prop_name] = []
+                if class_name not in class_properties[prop_name]:
+                    class_properties[prop_name].append(class_name)
+
+                # Also add as a "method" for matching
+                if prop_name not in class_methods:
+                    class_methods[prop_name] = []
+                if (class_name, True) not in class_methods[prop_name]:
+                    class_methods[prop_name].append((class_name, True))
+
+        # Get all method_call references
+        cursor = self.store.conn.execute("""
+            SELECT
+                cfr.target_name,
+                cfr.source_file,
+                cfr.line_number,
+                cfr.metadata,
+                e.name as caller_name
+            FROM cross_file_refs cfr
+            JOIN entities e ON cfr.source_entity_id = e.id
+            WHERE cfr.ref_type = 'method_call'
+        """)
+
+        total_calls = 0
+        getter_mismatches = 0
+        unknown_methods = 0
+
+        for row in cursor.fetchall():
+            total_calls += 1
+            method_name = row['target_name']
+            source_file = row['source_file'] or 'unknown'
+            line = row['line_number'] or 0
+            metadata = json.loads(row['metadata']) if row['metadata'] else {}
+            caller = row['caller_name']
+            full_expr = metadata.get('full_expression', method_name)
+            obj_path = metadata.get('object_path', [])
+
+            # Check for getFoo() when foo property exists
+            if method_name.startswith('get') and len(method_name) > 3:
+                # Extract property name: getFoo -> foo (lowercase first letter)
+                prop_name = method_name[3].lower() + method_name[4:]
+
+                # Check if this method exists on any class
+                method_exists = method_name in class_methods
+
+                # Check if property exists but method doesn't
+                if not method_exists and prop_name in class_properties:
+                    getter_mismatches += 1
+                    classes_with_prop = class_properties[prop_name]
+
+                    result.errors.append(ValidationIssue(
+                        level='error',
+                        category='method_call',
+                        message=f"'{method_name}()' not found - did you mean '{prop_name}'? "
+                                f"(property exists on {', '.join(classes_with_prop)})",
+                        file=source_file,
+                        line=line,
+                        details={
+                            'called_method': method_name,
+                            'suggested_property': prop_name,
+                            'full_expression': full_expr,
+                            'classes_with_property': classes_with_prop,
+                            'caller': caller
+                        }
+                    ))
+                    continue
+
+            # Check for setFoo() when foo property exists
+            if method_name.startswith('set') and len(method_name) > 3:
+                prop_name = method_name[3].lower() + method_name[4:]
+                method_exists = method_name in class_methods
+
+                if not method_exists and prop_name in class_properties:
+                    getter_mismatches += 1
+                    classes_with_prop = class_properties[prop_name]
+
+                    result.errors.append(ValidationIssue(
+                        level='error',
+                        category='method_call',
+                        message=f"'{method_name}()' not found - did you mean '{prop_name} = ...'? "
+                                f"(property exists on {', '.join(classes_with_prop)})",
+                        file=source_file,
+                        line=line,
+                        details={
+                            'called_method': method_name,
+                            'suggested_property': prop_name,
+                            'full_expression': full_expr,
+                            'classes_with_property': classes_with_prop,
+                            'caller': caller
+                        }
+                    ))
+                    continue
+
+        result.stats = {
+            'total_method_calls': total_calls,
+            'getter_mismatches': getter_mismatches,
+            'unknown_methods': unknown_methods,
+            'known_class_methods': len(class_methods),
+            'known_properties': len(class_properties)
+        }
+
+        return result
+
     def _resolve_import(self, source_dir: Path, import_path: str) -> Optional[Path]:
         """Resolve a relative import path to an actual file.
 
@@ -318,6 +517,8 @@ def cmd_validate(args):
         result = validator.validate_dom_references()
     elif args.check == 'imports':
         result = validator.validate_unresolved_imports()
+    elif args.check == 'methods':
+        result = validator.validate_method_calls()
     else:
         print(f"Unknown check type: {args.check}")
         store.close()

@@ -690,8 +690,83 @@ class JavaScriptParser(BaseParser):
                         # Check for DOM reference methods
                         self._extract_dom_reference(node, member, prop, source, caller_name, result)
 
+                        # Track method call with object context for validation
+                        self._extract_method_call(node, member, prop, source, caller_name, result)
+
         for child in node.children:
             self._extract_calls(child, source, caller_name, result)
+
+    def _get_member_expression_path(self, node: 'Node', source: str) -> List[str]:
+        """Recursively extract the full path of a member expression.
+
+        For `a.b.c`, returns ['a', 'b', 'c'].
+        """
+        parts = []
+        current = node
+
+        while current:
+            if current.type == 'identifier':
+                parts.insert(0, self._get_node_text(current, source))
+                break
+            elif current.type == 'member_expression':
+                prop = self._find_child(current, 'property_identifier')
+                if prop:
+                    parts.insert(0, self._get_node_text(prop, source))
+                # Move to the object part
+                obj = None
+                for child in current.children:
+                    if child.type in ('identifier', 'member_expression', 'this'):
+                        obj = child
+                        break
+                current = obj
+            elif current.type == 'this':
+                parts.insert(0, 'this')
+                break
+            else:
+                break
+
+        return parts
+
+    def _extract_method_call(
+        self,
+        call_node: 'Node',
+        member_node: 'Node',
+        prop_node: 'Node',
+        source: str,
+        caller_name: str,
+        result: ParseResult,
+    ) -> None:
+        """Extract method call with object context for validation.
+
+        Tracks calls like `obj.method()` or `a.b.c.method()` to enable
+        validation that the method exists on the target type.
+        """
+        method_name = self._get_node_text(prop_node, source)
+        line_num = call_node.start_point[0] + 1
+
+        # Get the object path (everything before the method)
+        obj_path = self._get_member_expression_path(member_node, source)
+        if obj_path:
+            # Remove the method name (last element) if it got included
+            if obj_path and obj_path[-1] == method_name:
+                obj_path = obj_path[:-1]
+
+        # Only track if we have an object path
+        if not obj_path:
+            return
+
+        # Get the immediate object (last part of path before method)
+        immediate_object = obj_path[-1] if obj_path else None
+
+        # Store as a method_call reference for validation
+        result.relationships.append((caller_name, method_name, "method_call", {
+            'method': method_name,
+            'object_path': obj_path,
+            'full_expression': '.'.join(obj_path + [method_name]),
+            'immediate_object': immediate_object,
+            'line': line_num,
+            'verifiable': True  # Can be verified against class definitions
+        }))
 
     def _extract_dom_reference(
         self,
