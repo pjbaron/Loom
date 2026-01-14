@@ -129,7 +129,7 @@ def orphan_entities() -> str:
 
             lines.append(f"Found {len(uncalled)} Uncalled Methods/Functions total:")
             lines.append("")
-            lines.append("(May include constructors, getters, and future-use methods)")
+            lines.append("(Excludes constructors, getters/setters, private methods)")
             lines.append("")
 
             # Group by module/class

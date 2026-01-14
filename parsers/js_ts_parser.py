@@ -693,6 +693,25 @@ class JavaScriptParser(BaseParser):
                         # Track method call with object context for validation
                         self._extract_method_call(node, member, prop, source, caller_name, result)
 
+        elif node.type == 'new_expression':
+            # Handle `new ClassName()` - this calls the constructor
+            # The class name can be an identifier or member expression
+            for child in node.children:
+                if child.type == 'identifier':
+                    class_name = self._get_node_text(child, source)
+                    # Track as call to constructor
+                    result.relationships.append((caller_name, class_name, "calls"))
+                    result.relationships.append((caller_name, "constructor", "calls"))
+                    break
+                elif child.type == 'member_expression':
+                    # e.g., `new Module.ClassName()`
+                    prop = self._find_child(child, 'property_identifier')
+                    if prop:
+                        class_name = self._get_node_text(prop, source)
+                        result.relationships.append((caller_name, class_name, "calls"))
+                        result.relationships.append((caller_name, "constructor", "calls"))
+                    break
+
         for child in node.children:
             self._extract_calls(child, source, caller_name, result)
 

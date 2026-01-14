@@ -1206,6 +1206,22 @@ class CodeStore(SchemaMixin, ChangeTrackingMixin, TraceMixin, NoteMixin, Ingesti
                 if not m['name'].split('.')[-1].startswith('_')
             ]
 
+        # Filter out constructors - they're called via `new ClassName()`
+        # which is tracked as calls to both the class name and "constructor"
+        uncalled = [
+            m for m in uncalled
+            if m['name'].split('.')[-1] != 'constructor'
+        ]
+
+        # Filter out getters/setters - they're accessed as properties, not called
+        # JS getters are defined as `get propName() { ... }`
+        # JS setters are defined as `set propName(value) { ... }`
+        def is_getter_or_setter(method):
+            code = method.get('code', '') or ''
+            return code.strip().startswith('get ') or code.strip().startswith('set ')
+
+        uncalled = [m for m in uncalled if not is_getter_or_setter(m)]
+
         return uncalled
 
     def get_path(
