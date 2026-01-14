@@ -169,15 +169,21 @@ class IngestionMixin:
                     # Store relationships (handle both 3-tuple and 4-tuple formats)
                     for rel in parse_result.relationships:
                         if len(rel) == 4:
-                            from_name, to_name, relation, metadata = rel
+                            from_name, to_name, relation, rel_metadata = rel
                         else:
                             from_name, to_name, relation = rel
-                            metadata = None
+                            rel_metadata = None
                         from_id = name_to_id.get(from_name)
                         to_id = name_to_id.get(to_name)
 
                         if from_id and to_id:
-                            self.add_relationship(from_id, to_id, relation)
+                            self.add_relationship(from_id, to_id, relation, rel_metadata)
+                        elif from_id and relation == 'dom_reference':
+                            # DOM references may point to elements in other files
+                            # Store as a special relationship with target as name
+                            self._store_cross_file_reference(
+                                from_id, to_name, relation, rel_metadata, str(source_file)
+                            )
 
             # Mark ingest run as completed
             self.end_ingest_run(ingest_run_id, stats, "completed")
@@ -187,6 +193,41 @@ class IngestionMixin:
             raise
 
         return stats
+
+    def _store_cross_file_reference(
+        self,
+        source_entity_id: int,
+        target_name: str,
+        ref_type: str,
+        metadata: dict,
+        source_file: str
+    ):
+        """Store a cross-file reference (e.g., JS DOM reference to HTML element).
+
+        These are references where the target may be in a different file
+        and needs to be validated after all files are ingested.
+        """
+        import json
+
+        line_number = metadata.get('line', 0) if metadata else 0
+        verifiable = metadata.get('verifiable', True) if metadata else True
+        reason = metadata.get('reason', None) if metadata else None
+
+        self.conn.execute("""
+            INSERT INTO cross_file_refs
+            (source_entity_id, target_name, ref_type, source_file, line_number, verifiable, verification_reason, metadata)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        """, (
+            source_entity_id,
+            target_name,
+            ref_type,
+            source_file,
+            line_number,
+            1 if verifiable else 0,
+            reason,
+            json.dumps(metadata) if metadata else None
+        ))
+        self.conn.commit()
 
     def _ingest_file(self, file_path: Path, base_path: Path, stats: Dict):
         """Ingest a single Python file.

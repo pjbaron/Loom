@@ -25,7 +25,16 @@ import sys
 from pathlib import Path
 
 from codestore import CodeStore
-from refactor import cmd_clusters
+from validation import cmd_validate
+
+# Optional: refactor module may not exist yet
+try:
+    from refactor import cmd_clusters
+except ImportError:
+    def cmd_clusters(args):
+        """Placeholder for cluster analysis (not yet implemented)."""
+        print("Error: clusters command not yet implemented (refactor.py missing)")
+        return 1
 
 
 def cmd_ingest(args):
@@ -1205,6 +1214,35 @@ Examples:
     p_todo_search.add_argument("--limit", type=int, default=20, help="Maximum results")
     p_todo_search.add_argument("--db", default=".loom/store.db", help=db_help)
 
+    # validate - cross-language validation
+    p_validate = subparsers.add_parser("validate", help="Validate code for cross-reference issues",
+        description="""
+Cross-language code validation.
+
+Checks for:
+  - DOM references: JS getElementById/querySelector calls that reference
+    non-existent HTML element IDs
+  - Imports: Relative import statements that point to missing files
+
+Reports:
+  - ERRORS: Verifiable issues that must be fixed
+  - WARNINGS: Patterns that cannot be verified statically (LLM should review)
+
+Examples:
+  ./loom validate                    # Run all validations
+  ./loom validate --check dom        # Only check DOM references
+  ./loom validate --level warn       # Show warnings too
+  ./loom validate --json             # Output as JSON (for CI)
+""",
+        formatter_class=argparse.RawDescriptionHelpFormatter)
+    p_validate.add_argument("--check", choices=["all", "dom", "imports"], default="all",
+                            help="What to validate (default: all)")
+    p_validate.add_argument("--level", choices=["error", "warn", "all"], default="error",
+                            help="Minimum issue level to show (default: error)")
+    p_validate.add_argument("--json", action="store_true", help="Output as JSON")
+    p_validate.add_argument("--verbose", "-v", action="store_true", help="Show detailed issue info")
+    p_validate.add_argument("--db", default=".loom/store.db", help=db_help)
+
     args = parser.parse_args()
 
     if not args.command:
@@ -1224,6 +1262,7 @@ Examples:
         "failure-log": cmd_failure_log,
         "attempted-fixes": cmd_attempted_fixes,
         "todo": cmd_todo,
+        "validate": cmd_validate,
     }
 
     return commands[args.command](args)

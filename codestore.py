@@ -23,7 +23,7 @@ from collections import deque
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, Union
 
-from parsers import ParserRegistry, PythonParser, JavaScriptParser, TypeScriptParser, CppParser
+from parsers import ParserRegistry, PythonParser, JavaScriptParser, TypeScriptParser, CppParser, ActionScript3Parser, HTMLParser
 from trace_storage import TraceMixin
 from change_tracking import ChangeTrackingMixin
 from schema import SchemaMixin
@@ -51,6 +51,11 @@ class CodeStore(SchemaMixin, ChangeTrackingMixin, TraceMixin, NoteMixin, Ingesti
         self.parser_registry.register(JavaScriptParser())
         self.parser_registry.register(TypeScriptParser())
         self.parser_registry.register(CppParser())
+        try:
+            self.parser_registry.register(ActionScript3Parser())
+            self.parser_registry.register(HTMLParser())
+        except ImportError:
+            pass  # tree-sitter-language-pack not installed
 
     # --- Entity Management ---
 

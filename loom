@@ -38,6 +38,14 @@ Refactoring:
     ./loom extract start_trace_run end_trace_run record_call --preview
     ./loom extract start_trace_run end_trace_run --to trace_storage --preview
 
+Validation:
+  loom validate                        - Validate cross-file references (DOM, imports)
+  loom validate --check dom            - Only check DOM references
+  loom validate --check imports        - Only check import resolution
+  loom validate --level warn           - Include warnings (unverifiable patterns)
+  loom validate --json                 - Output as JSON (for CI integration)
+  loom validate -v                     - Verbose output with details
+
 Notes and Knowledge Base:
   loom note <content>                  - Add analysis note
   loom intent <entity> <why>           - Document why entity exists
@@ -212,6 +220,18 @@ def cmd_ingest(target_path):
     print(f"  Analyzed:      {call_stats.get('analyzed', 0)} functions")
     print(f"  Calls:         {call_stats.get('calls_found', 0)} found")
     print(f"  Relationships: {call_stats.get('relationships_created', 0)} created")
+    print()
+
+    # Generate embeddings for semantic search
+    print("Generating embeddings for semantic search...")
+    try:
+        embed_stats = store.generate_embeddings()
+        print(f"  Entities:   {embed_stats.get('embeddings_created', 0)} embedded")
+        if embed_stats.get('skipped', 0) > 0:
+            print(f"  Skipped:    {embed_stats.get('skipped', 0)}")
+    except RuntimeError as e:
+        print(f"  Skipped: {e}")
+        print("  (Install sentence-transformers for semantic search)")
     print()
 
     print(f"Database saved to: {db_path}")
@@ -1400,6 +1420,11 @@ def main():
         from cli import main as cli_main
         # Reconstruct sys.argv for cli.py
         sys.argv = ['loom', 'todo'] + args
+        sys.exit(cli_main())
+    elif cmd == 'validate':
+        # Cross-file validation - delegate to cli.py
+        from cli import main as cli_main
+        sys.argv = ['loom', 'validate'] + args
         sys.exit(cli_main())
     else:
         print(__doc__)

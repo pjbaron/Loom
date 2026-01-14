@@ -17,7 +17,7 @@ class SchemaMixin:
     """Mixin providing database schema initialization and migrations."""
 
     # Current schema version for migrations
-    SCHEMA_VERSION = 7
+    SCHEMA_VERSION = 8
 
     def _init_schema(self):
         """Initialize database schema."""
@@ -113,6 +113,10 @@ class SchemaMixin:
         if current_version < 7:
             self._migrate_to_v7()
             self._set_schema_version(7)
+
+        if current_version < 8:
+            self._migrate_to_v8()
+            self._set_schema_version(8)
 
     def _migrate_to_v2(self):
         """Migration v2: Add runtime tracing tables."""
@@ -304,6 +308,31 @@ class SchemaMixin:
         # Create position index if it doesn't exist
         self.conn.execute("CREATE INDEX IF NOT EXISTS idx_todos_position ON todos(position)")
 
+        self.conn.commit()
+
+    def _migrate_to_v8(self):
+        """Migration v8: Add cross-file references table for DOM validation."""
+        self.conn.executescript("""
+            -- Track cross-file references (e.g., JS -> HTML DOM elements)
+            -- These are relationships where the target may not exist as an entity
+            CREATE TABLE IF NOT EXISTS cross_file_refs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                source_entity_id INTEGER NOT NULL,      -- The entity making the reference
+                target_name TEXT NOT NULL,              -- The name being referenced (e.g., element ID)
+                ref_type TEXT NOT NULL,                 -- 'dom_reference', 'import', etc.
+                source_file TEXT,                       -- File containing the reference
+                line_number INTEGER,                    -- Line number in source file
+                verifiable BOOLEAN DEFAULT 1,           -- Can this be statically verified?
+                verification_reason TEXT,               -- If not verifiable, why?
+                metadata TEXT,                          -- JSON blob with extra info
+                created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (source_entity_id) REFERENCES entities(id) ON DELETE CASCADE
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_cross_file_refs_type ON cross_file_refs(ref_type);
+            CREATE INDEX IF NOT EXISTS idx_cross_file_refs_target ON cross_file_refs(target_name);
+            CREATE INDEX IF NOT EXISTS idx_cross_file_refs_source ON cross_file_refs(source_entity_id);
+        """)
         self.conn.commit()
 
     def _init_vec_table(self):

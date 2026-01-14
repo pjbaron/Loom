@@ -168,6 +168,8 @@ class JavaScriptParser(BaseParser):
                 "code": None,
                 "metadata": {"file_path": file_path, "language": self.language},
             })
+            # Extract module-level calls (including DOM references)
+            self._extract_calls(node, source, module_name, result)
 
         for child in node.children:
             if child.type == 'function_declaration':
@@ -685,8 +687,128 @@ class JavaScriptParser(BaseParser):
                         callee = self._get_node_text(prop, source)
                         result.relationships.append((caller_name, callee, "calls"))
 
+                        # Check for DOM reference methods
+                        self._extract_dom_reference(node, member, prop, source, caller_name, result)
+
         for child in node.children:
             self._extract_calls(child, source, caller_name, result)
+
+    def _extract_dom_reference(
+        self,
+        call_node: 'Node',
+        member_node: 'Node',
+        prop_node: 'Node',
+        source: str,
+        caller_name: str,
+        result: ParseResult,
+    ) -> None:
+        """Extract DOM element references from getElementById/querySelector calls.
+
+        Tracks:
+        - Static references: getElementById('myId') -> dom_reference relationship
+        - Dynamic references: getElementById(variable) -> unverifiable_dom_reference
+        """
+        method_name = self._get_node_text(prop_node, source)
+
+        # Check if this is a DOM query method
+        if method_name not in ('getElementById', 'querySelector', 'querySelectorAll'):
+            return
+
+        # Verify it's called on document (or could be element for querySelector*)
+        obj_node = None
+        for child in member_node.children:
+            if child.type == 'identifier':
+                obj_node = child
+                break
+            elif child.type == 'member_expression':
+                # Could be window.document or similar
+                obj_node = child
+                break
+
+        # Get the arguments
+        args_node = self._find_child(call_node, 'arguments')
+        if args_node is None:
+            return
+
+        # Find the first argument
+        first_arg = None
+        for child in args_node.children:
+            if child.type in ('string', 'template_string', 'identifier', 'member_expression'):
+                first_arg = child
+                break
+
+        if first_arg is None:
+            return
+
+        line_num = call_node.start_point[0] + 1
+
+        if first_arg.type == 'string':
+            # Static string - we can verify this
+            selector = self._get_node_text(first_arg, source).strip("'\"")
+
+            # Extract the ID from the selector
+            element_id = None
+            if method_name == 'getElementById':
+                element_id = selector
+            elif method_name in ('querySelector', 'querySelectorAll'):
+                # Extract ID from CSS selector like '#myId' or '#myId .child'
+                if selector.startswith('#'):
+                    # Get just the ID part (stop at space, dot, bracket, etc.)
+                    id_match = selector[1:].split()[0] if ' ' in selector else selector[1:]
+                    for delim in ('.', '[', ':', '>'):
+                        if delim in id_match:
+                            id_match = id_match.split(delim)[0]
+                    element_id = id_match
+
+            if element_id:
+                result.relationships.append((caller_name, element_id, "dom_reference", {
+                    'method': method_name,
+                    'selector': selector,
+                    'line': line_num,
+                    'verifiable': True
+                }))
+
+        elif first_arg.type == 'template_string':
+            # Template string - may contain dynamic parts
+            template_text = self._get_node_text(first_arg, source)
+            has_interpolation = '${' in template_text
+
+            if has_interpolation:
+                # Dynamic - cannot verify
+                result.relationships.append((caller_name, template_text, "dom_reference", {
+                    'method': method_name,
+                    'selector': template_text,
+                    'line': line_num,
+                    'verifiable': False,
+                    'reason': 'Template string with interpolation'
+                }))
+            else:
+                # Static template string (no interpolation)
+                selector = template_text.strip('`')
+                element_id = None
+                if method_name == 'getElementById':
+                    element_id = selector
+                elif selector.startswith('#'):
+                    element_id = selector[1:].split()[0]
+
+                if element_id:
+                    result.relationships.append((caller_name, element_id, "dom_reference", {
+                        'method': method_name,
+                        'selector': selector,
+                        'line': line_num,
+                        'verifiable': True
+                    }))
+
+        else:
+            # Variable or expression - cannot verify statically
+            arg_text = self._get_node_text(first_arg, source)
+            result.relationships.append((caller_name, arg_text, "dom_reference", {
+                'method': method_name,
+                'selector': arg_text,
+                'line': line_num,
+                'verifiable': False,
+                'reason': 'Dynamic value (variable or expression)'
+            }))
 
 
 class TypeScriptParser(JavaScriptParser):
