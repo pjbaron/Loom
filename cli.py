@@ -1239,8 +1239,8 @@ Examples:
   ./loom validate --json             # Output as JSON (for CI)
 """,
         formatter_class=argparse.RawDescriptionHelpFormatter)
-    p_validate.add_argument("--check", choices=["all", "dom", "imports", "methods", "syntax"], default="all",
-                            help="What to validate: all, dom, imports, methods, syntax (default: all)")
+    p_validate.add_argument("--check", choices=["all", "dom", "imports", "methods", "syntax", "exports"], default="all",
+                            help="What to validate: all, dom, imports, methods, syntax, exports (default: all)")
     p_validate.add_argument("--level", choices=["error", "warn", "all"], default="error",
                             help="Minimum issue level to show (default: error)")
     p_validate.add_argument("--json", action="store_true", help="Output as JSON")

@@ -14,6 +14,8 @@ Reports:
 
 import json
 import re
+import subprocess
+import shutil
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Any
 from dataclasses import dataclass, field
@@ -25,6 +27,9 @@ try:
 except ImportError:
     esprima = None
     HAS_ESPRIMA = False
+
+# Check for esbuild availability
+HAS_ESBUILD = shutil.which('npx') is not None
 
 
 @dataclass
@@ -87,16 +92,19 @@ class CodeValidator:
         import_result = self.validate_unresolved_imports()
         method_result = self.validate_method_calls()
         syntax_result = self.validate_js_syntax()
+        exports_result = self.validate_js_exports()
 
         # Combine results
         result.errors.extend(dom_result.errors)
         result.errors.extend(import_result.errors)
         result.errors.extend(method_result.errors)
         result.errors.extend(syntax_result.errors)
+        result.errors.extend(exports_result.errors)
         result.warnings.extend(dom_result.warnings)
         result.warnings.extend(import_result.warnings)
         result.warnings.extend(method_result.warnings)
         result.warnings.extend(syntax_result.warnings)
+        result.warnings.extend(exports_result.warnings)
 
         # Combine stats
         result.stats = {
@@ -104,6 +112,7 @@ class CodeValidator:
             'imports': import_result.stats,
             'methods': method_result.stats,
             'syntax': syntax_result.stats,
+            'exports': exports_result.stats,
             'total_errors': len(result.errors),
             'total_warnings': len(result.warnings)
         }
@@ -665,6 +674,212 @@ class CodeValidator:
 
         return result
 
+    def validate_js_exports(self) -> ValidationResult:
+        """Validate JavaScript imports resolve to actual exports using esbuild.
+
+        This catches errors that esprima cannot detect:
+        - Named imports that don't exist in the target module
+        - Default imports from modules without default export
+        - Re-export issues
+
+        Uses esbuild's bundler which validates all import/export bindings.
+        """
+        result = ValidationResult()
+
+        if not HAS_ESBUILD:
+            result.warnings.append(ValidationIssue(
+                level='warning',
+                category='exports',
+                message="npx not found - cannot run esbuild for export validation",
+                file='',
+                line=0,
+                details={}
+            ))
+            result.stats = {'skipped': True, 'reason': 'npx not available'}
+            return result
+
+        # Find JavaScript entry points (files with imports but not imported by others)
+        # For simplicity, we'll try to bundle each JS file individually
+        cursor = self.store.conn.execute("""
+            SELECT DISTINCT json_extract(metadata, '$.file_path') as file_path
+            FROM entities
+            WHERE metadata IS NOT NULL
+              AND (json_extract(metadata, '$.file_path') LIKE '%.js'
+                   OR json_extract(metadata, '$.file_path') LIKE '%.mjs')
+        """)
+
+        js_files = [row['file_path'] for row in cursor.fetchall() if row['file_path']]
+
+        if not js_files:
+            result.stats = {'skipped': True, 'reason': 'no JS files found'}
+            return result
+
+        # Find a common root directory
+        if js_files:
+            first_file = Path(js_files[0])
+            # Walk up to find project root (look for package.json or src folder)
+            project_root = first_file.parent
+            for _ in range(10):  # Max 10 levels up
+                if (project_root / 'package.json').exists():
+                    break
+                if (project_root / 'src').exists() and project_root.parent != project_root:
+                    break
+                if project_root.parent == project_root:
+                    break
+                project_root = project_root.parent
+
+        # Find all files that have imports - each needs to be validated
+        # because esbuild only catches errors in files it actually processes
+        entry_candidates = []
+        for f in js_files:
+            try:
+                content = Path(f).read_text(encoding='utf-8', errors='replace')
+                if re.search(r'^\s*import\s', content, re.MULTILINE):
+                    entry_candidates.append(f)
+            except Exception:
+                continue
+
+        # Prioritize common entry points first (for better error reporting)
+        def sort_key(f):
+            name = Path(f).name.lower()
+            if name in ('main.js', 'index.js', 'app.js', 'game.js', 'entry.js'):
+                return (0, f)
+            return (1, f)
+        entry_candidates.sort(key=sort_key)
+
+        # Check all files with imports (no limit - export errors are critical)
+        # esbuild is fast enough to handle this
+
+        total_checked = 0
+        export_errors = 0
+        files_with_errors = set()
+
+        for entry_file in entry_candidates:
+            total_checked += 1
+            entry_path = Path(entry_file)
+
+            if not entry_path.exists():
+                continue
+
+            # Run esbuild in analyze mode (bundle but don't write)
+            try:
+                proc = subprocess.run(
+                    [
+                        'npx', 'esbuild',
+                        str(entry_path),
+                        '--bundle',
+                        '--format=esm',
+                        '--platform=browser',
+                        '--outfile=/dev/null',
+                        '--log-level=error'
+                    ],
+                    capture_output=True,
+                    text=True,
+                    timeout=30,
+                    cwd=str(project_root) if project_root else None
+                )
+
+                # Parse esbuild error output
+                if proc.returncode != 0:
+                    stderr = proc.stderr
+
+                    # Parse esbuild error format:
+                    # ✘ [ERROR] No matching export in "file.js" for import "name"
+                    #     file.js:10:20:
+                    #       10 │ import { name } from './file.js'
+                    #          ╵          ~~~~
+                    # Note: esbuild uses Unicode symbols (✘, │, ╵) so we match loosely
+
+                    error_pattern = r'\[ERROR\]\s+(.+?)\n\s+(\S+):(\d+):(\d+):'
+                    for match in re.finditer(error_pattern, stderr):
+                        error_msg = match.group(1).strip()
+                        error_file = match.group(2)
+                        error_line = int(match.group(3))
+                        error_col = int(match.group(4))
+
+                        # Check if this is an export-related error
+                        is_export_error = any(phrase in error_msg.lower() for phrase in [
+                            'no matching export',
+                            'does not provide an export',
+                            'is not exported',
+                            'could not resolve',
+                            'no exported member'
+                        ])
+
+                        if is_export_error:
+                            export_errors += 1
+                            files_with_errors.add(error_file)
+
+                            # Extract the missing export name if possible
+                            export_match = re.search(r'["\'](\w+)["\']', error_msg)
+                            missing_export = export_match.group(1) if export_match else None
+
+                            result.errors.append(ValidationIssue(
+                                level='error',
+                                category='export',
+                                message=error_msg,
+                                file=error_file,
+                                line=error_line,
+                                details={
+                                    'error_column': error_col,
+                                    'missing_export': missing_export,
+                                    'entry_point': str(entry_file),
+                                    'esbuild_error': True
+                                }
+                            ))
+                        else:
+                            # Other esbuild errors (syntax, etc.)
+                            result.warnings.append(ValidationIssue(
+                                level='warning',
+                                category='export',
+                                message=f"esbuild: {error_msg}",
+                                file=error_file,
+                                line=error_line,
+                                details={
+                                    'error_column': error_col,
+                                    'entry_point': str(entry_file)
+                                }
+                            ))
+
+            except subprocess.TimeoutExpired:
+                result.warnings.append(ValidationIssue(
+                    level='warning',
+                    category='export',
+                    message=f"esbuild timed out validating {entry_file}",
+                    file=str(entry_file),
+                    line=0,
+                    details={}
+                ))
+            except FileNotFoundError:
+                result.warnings.append(ValidationIssue(
+                    level='warning',
+                    category='export',
+                    message="esbuild not installed - run 'npm install -g esbuild' for export validation",
+                    file='',
+                    line=0,
+                    details={}
+                ))
+                result.stats = {'skipped': True, 'reason': 'esbuild not installed'}
+                return result
+            except Exception as e:
+                result.warnings.append(ValidationIssue(
+                    level='warning',
+                    category='export',
+                    message=f"esbuild error: {str(e)}",
+                    file=str(entry_file),
+                    line=0,
+                    details={}
+                ))
+
+        result.stats = {
+            'entry_points_checked': total_checked,
+            'export_errors': export_errors,
+            'files_with_errors': len(files_with_errors),
+            'js_files_total': len(js_files)
+        }
+
+        return result
+
     def _validate_js_file(self, js_code: str, file_path: str) -> Dict[str, Any]:
         """Validate a single JavaScript file using esprima.
 
@@ -1077,6 +1292,8 @@ def cmd_validate(args):
         result = validator.validate_method_calls()
     elif args.check == 'syntax':
         result = validator.validate_js_syntax()
+    elif args.check == 'exports':
+        result = validator.validate_js_exports()
     else:
         print(f"Unknown check type: {args.check}")
         store.close()
