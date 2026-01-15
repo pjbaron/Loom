@@ -26,6 +26,7 @@ from pathlib import Path
 
 from codestore import CodeStore
 from validation import cmd_validate
+from detection_tools import cmd_issues
 
 # Optional: refactor module may not exist yet
 try:
@@ -1247,6 +1248,43 @@ Examples:
     p_validate.add_argument("--verbose", "-v", action="store_true", help="Show detailed issue info")
     p_validate.add_argument("--db", default=".loom/store.db", help=db_help)
 
+    # issues - incomplete code detection
+    p_issues = subparsers.add_parser("issues", help="Detect incomplete code and wiring issues",
+        description="""
+Detect incomplete code.
+
+Detects:
+  - TODO/FIXME/STUB comments indicating incomplete code
+  - Callbacks that are checked but never assigned (wiring issues)
+  - Dead code: methods defined but never called (via call graph)
+  - Setup/init methods that are never invoked (likely bugs)
+
+These complement the validate command by finding deeper issues.
+
+Output Formats:
+  - Default: Human-readable grouped by category
+  - --json: Full JSON with all details
+  - --critical-issues: CRITICAL_ISSUES.json format for task_runner.py
+
+Examples:
+  ./loom issues                    # Find all detectable issues
+  ./loom issues --check todo       # Only find TODO comments
+  ./loom issues --check callback   # Only find unassigned callbacks
+  ./loom issues --check dead_code  # Only find dead code
+  ./loom issues --level all        # Include low-priority issues
+  ./loom issues --json             # Output as JSON
+  ./loom issues --critical-issues  # Output for task_runner.py integration
+""",
+        formatter_class=argparse.RawDescriptionHelpFormatter)
+    p_issues.add_argument("--check", choices=["all", "todo", "callback", "dead_code"], default="all",
+                          help="What to detect: all, todo, callback, dead_code (default: all)")
+    p_issues.add_argument("--level", choices=["high", "all"], default="high",
+                          help="Include low-priority issues (default: high = critical/high/medium only)")
+    p_issues.add_argument("--json", action="store_true", help="Output as JSON")
+    p_issues.add_argument("--critical-issues", action="store_true", dest="critical_issues",
+                          help="Output in CRITICAL_ISSUES.json format for task_runner.py")
+    p_issues.add_argument("--db", default=".loom/store.db", help=db_help)
+
     args = parser.parse_args()
 
     if not args.command:
@@ -1267,6 +1305,7 @@ Examples:
         "attempted-fixes": cmd_attempted_fixes,
         "todo": cmd_todo,
         "validate": cmd_validate,
+        "issues": cmd_issues,
     }
 
     return commands[args.command](args)

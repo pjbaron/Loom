@@ -1426,6 +1426,11 @@ def main():
         from cli import main as cli_main
         sys.argv = ['loom', 'validate'] + args
         sys.exit(cli_main())
+    elif cmd == 'issues':
+        # Incomplete code detection - delegate to cli.py
+        from cli import main as cli_main
+        sys.argv = ['loom', 'issues'] + args
+        sys.exit(cli_main())
     else:
         print(__doc__)
 
