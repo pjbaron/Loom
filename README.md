@@ -6,7 +6,7 @@ Loom builds a semantic graph of your codebase, enabling intelligent code navigat
 
 ## Features
 
-- **Semantic Code Search** - Find code by meaning, not just text matching
+- **Semantic Code Search** - Find code by meaning or intent
 - **Impact Analysis** - See what breaks before you change it
 - **Call Graph Navigation** - Trace callers and callees across your codebase
 - **Debug Context** - Get comprehensive context for errors including traces and related code
