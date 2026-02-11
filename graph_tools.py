@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/usr/bin/env python
 """
 graph_tools - Architecture and graph analysis functions for Claude Code.
 

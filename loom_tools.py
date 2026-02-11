@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/usr/bin/env python
 """
 loom_tools - Simple functions for Claude Code to understand codebases.
 

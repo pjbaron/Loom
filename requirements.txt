@@ -1,0 +1,18 @@
+# Core: tree-sitter parsing
+tree-sitter>=0.21.0
+tree-sitter-javascript>=0.21.0
+tree-sitter-typescript>=0.21.0
+tree-sitter-cpp>=0.21.0
+tree-sitter-language-pack>=0.1.0
+
+# Semantic search embeddings
+sentence-transformers>=2.2.0
+sqlite-vec>=0.1.1
+
+# Optional: JavaScript syntax validation
+esprima
+
+# Dev/test tools
+pytest>=7.0.0
+pytest-cov>=4.0.0
+ruff>=0.1.0

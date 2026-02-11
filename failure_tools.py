@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/usr/bin/env python
 """
 failure_tools - Convenience functions for tracking failed fix attempts.
 

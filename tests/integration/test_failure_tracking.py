@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/usr/bin/env python
 """
 Integration test: Simulate debugging a function with failure tracking.
 """

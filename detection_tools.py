@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/usr/bin/env python
 """
 detection_tools - Static analysis issue detection for incomplete/broken code.
 

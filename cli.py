@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/usr/bin/env python
 """
 Loom CLI - Command-line interface for code analysis.
 

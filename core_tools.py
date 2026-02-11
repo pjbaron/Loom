@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/usr/bin/env python
 """
 core_tools - Core query functions for Claude Code to understand codebases.
 
