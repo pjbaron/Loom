@@ -48,14 +48,11 @@ class CodeStore(SchemaMixin, ChangeTrackingMixin, TraceMixin, NoteMixin, Ingesti
         # Initialize parser registry with default parsers
         self.parser_registry = ParserRegistry()
         self.parser_registry.register(PythonParser())
-        self.parser_registry.register(JavaScriptParser())
-        self.parser_registry.register(TypeScriptParser())
-        self.parser_registry.register(CppParser())
-        try:
-            self.parser_registry.register(ActionScript3Parser())
-            self.parser_registry.register(HTMLParser())
-        except ImportError:
-            pass  # tree-sitter-language-pack not installed
+        for ParserClass in [JavaScriptParser, TypeScriptParser, CppParser, ActionScript3Parser, HTMLParser]:
+            try:
+                self.parser_registry.register(ParserClass())
+            except ImportError:
+                pass
 
     # --- Entity Management ---
 

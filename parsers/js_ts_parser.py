@@ -6,11 +6,18 @@ from typing import List, Optional, Tuple
 
 try:
     import tree_sitter_javascript as tsjs
-    import tree_sitter_typescript as tsts
     from tree_sitter import Language, Parser, Node
-    TREE_SITTER_AVAILABLE = True
+    TREE_SITTER_JS_AVAILABLE = True
 except ImportError:
-    TREE_SITTER_AVAILABLE = False
+    TREE_SITTER_JS_AVAILABLE = False
+
+try:
+    import tree_sitter_typescript as tsts
+    if not TREE_SITTER_JS_AVAILABLE:
+        from tree_sitter import Language, Parser, Node
+    TREE_SITTER_TS_AVAILABLE = True
+except ImportError:
+    TREE_SITTER_TS_AVAILABLE = False
 
 from parsers.base import BaseParser, ParseResult
 
@@ -19,7 +26,7 @@ class JavaScriptParser(BaseParser):
     """Parser for JavaScript source files using tree-sitter."""
 
     def __init__(self):
-        if not TREE_SITTER_AVAILABLE:
+        if not TREE_SITTER_JS_AVAILABLE:
             raise ImportError(
                 "tree-sitter and tree-sitter-javascript are required. "
                 "Install with: pip install tree-sitter tree-sitter-javascript"
@@ -909,7 +916,7 @@ class TypeScriptParser(JavaScriptParser):
     """Parser for TypeScript source files using tree-sitter."""
 
     def __init__(self):
-        if not TREE_SITTER_AVAILABLE:
+        if not TREE_SITTER_TS_AVAILABLE:
             raise ImportError(
                 "tree-sitter and tree-sitter-typescript are required. "
                 "Install with: pip install tree-sitter tree-sitter-typescript"
