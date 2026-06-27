@@ -34,8 +34,15 @@ class IngestionMixin:
             ...
     """
 
-    # Default patterns to exclude during ingestion
-    DEFAULT_EXCLUDE_PATTERNS = ['.git', '__pycache__', '.claude/skills', 'node_modules', '.venv', 'venv']
+    # Default patterns to exclude during ingestion.
+    # Single-segment entries match a directory NAME anywhere in the tree (exact, via
+    # fnmatch on each path component). Multi-segment entries (containing '/') match
+    # against the relative path as a whole. Build/release output dirs are excluded
+    # because they hold bundled, minified, production code that pollutes the graph.
+    DEFAULT_EXCLUDE_PATTERNS = [
+        '.git', '__pycache__', '.claude/skills', 'node_modules', '.venv', 'venv',
+        'dist', 'build', 'release', 'release-test', 'out', 'coverage',
+    ]
 
     # Python builtins that should not be tracked as calls
     BUILTINS = frozenset({
@@ -110,10 +117,16 @@ class IngestionMixin:
                                 break
                         if skip:
                             break
-                    # Also check the full relative path for patterns like '.claude/skills'
+                    # Also check the full relative path, but ONLY for multi-segment
+                    # patterns like '.claude/skills'. Single-segment names are matched
+                    # against path COMPONENTS above; substring-matching them against the
+                    # whole path would wrongly drop files such as 'build.js' (pattern
+                    # 'build') or 'layout.js' (pattern 'out').
                     if not skip:
-                        rel_path_str = str(rel_path)
+                        rel_path_str = str(rel_path).replace('\\', '/')
                         for pattern in exclude_patterns:
+                            if '/' not in pattern:
+                                continue
                             if fnmatch(rel_path_str, pattern) or fnmatch(rel_path_str, f'*{pattern}*'):
                                 skip = True
                                 break
