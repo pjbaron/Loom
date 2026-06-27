@@ -1416,19 +1416,19 @@ def main():
         else:
             print(format_extraction_preview(result))
     elif cmd == 'todo':
-        # TODO management - delegate to cli.py for full argparse support
-        from cli import main as cli_main
-        # Reconstruct sys.argv for cli.py
+        # TODO management - delegate to loom_cli.py for full argparse support
+        from loom_cli import main as cli_main
+        # Reconstruct sys.argv for loom_cli.py
         sys.argv = ['loom', 'todo'] + args
         sys.exit(cli_main())
     elif cmd == 'validate':
-        # Cross-file validation - delegate to cli.py
-        from cli import main as cli_main
+        # Cross-file validation - delegate to loom_cli.py
+        from loom_cli import main as cli_main
         sys.argv = ['loom', 'validate'] + args
         sys.exit(cli_main())
     elif cmd == 'issues':
-        # Incomplete code detection - delegate to cli.py
-        from cli import main as cli_main
+        # Incomplete code detection - delegate to loom_cli.py
+        from loom_cli import main as cli_main
         sys.argv = ['loom', 'issues'] + args
         sys.exit(cli_main())
     else:

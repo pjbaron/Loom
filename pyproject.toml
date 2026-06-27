@@ -64,7 +64,7 @@ all = [
 ]
 
 [project.scripts]
-loom = "cli:main"
+loom = "loom_cli:main"
 
 [project.urls]
 Homepage = "https://github.com/anthropics/loom"
